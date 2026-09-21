@@ -41,7 +41,16 @@ function mkEl(id) {
       toggle(c, on) { if (on === undefined) on = !this._s.has(c); on ? this._s.add(c) : this._s.delete(c); return on; },
     },
     appendChild() {}, remove() {}, addEventListener() {}, focus() {},
-    closest() { return null; }, querySelectorAll() { return []; },
+    closest() { return null; }, querySelectorAll() { return []; }, querySelector() { return null; },
+    // 属性读写：顶栏域开关的按钮是 setAttribute('data-realm') 建出来的（点击委托靠
+    // closest('[data-realm]')），桩里缺这三个方法会在建开关时直接抛错。
+    _attrs: {},
+    setAttribute(k, v) { this._attrs[k] = String(v); },
+    getAttribute(k) { return Object.prototype.hasOwnProperty.call(this._attrs, k) ? this._attrs[k] : null; },
+    hasAttribute(k) { return Object.prototype.hasOwnProperty.call(this._attrs, k); },
+    removeAttribute(k) { delete this._attrs[k]; },
+    // 布局尺寸：滑动胶囊按 offsetLeft/offsetWidth 定位；预览页只验证仪表盘渲染，给 0 即可。
+    offsetLeft: 0, offsetWidth: 0,
   };
 }
 function getEl(id) {

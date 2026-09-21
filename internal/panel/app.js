@@ -11,6 +11,14 @@ let view = 'accounts';
 let overviewData = null, cfgLoaded = null;
 let logPin = true, loginState = null, loginTimer = null;
 let refTimer = null;
+// POLL_MS 面板轮询间隔（毫秒）。日志页脚要把它写出来，所以只此一处定义——
+// 以前页脚硬编码「自动刷新 1.5s」，而真实间隔是 5s，写的和做的不一致。
+const POLL_MS = 5000;
+// 任务队列的轮询定时器与代次。**必须在这里声明**：applyCnOnlyViews() 在模块顶层
+// 就会被调用一次（见文件末尾），若等到队列那一节才 let 声明，这里引用会撞 TDZ 直接崩
+// ——这个坑本文件已经踩过一次（见 4150 行那段注释）。
+// queueTimer / lastQueueSeq 的声明已上移到文件头状态区（applyCnOnlyViews 会在模块
+// 顶层引用 queueTimer，声明留在这一节会撞 TDZ）。
 
 const $ = id => document.getElementById(id);
 
@@ -47,14 +55,64 @@ function realmAccountCounts() {
   return n;
 }
 
+// REALM_CHIPS 域开关的三项（顺序即显示顺序）。
+const REALM_CHIPS = [['all', '全部'], ['cn', '国服'], ['global', '国际服']];
+let realmBtns = null, realmInd = null;   // 三个按钮与滑动胶囊（建一次就留着）
+
+// renderRealmSwitch 画出/更新顶栏的域开关。
+//
+// **只在第一次建 DOM，之后原地更新**（切 class、改计数）。为什么不能每次 innerHTML 重建：
+// 重建会把按钮节点整个换掉——CSS 过渡与 :active 按压反馈全部失效，而本函数每 5 秒还会被
+// 轮询调一次（applyStatus → 这里），等于每隔 5 秒吃掉一次你的点击反馈。原地更新才能让
+// 「胶囊滑过去」这个过渡真的播出来。
 function renderRealmSwitch() {
   const el = $('realmSwitch');
   if (!el) return;
+  if (!realmBtns) {
+    realmInd = document.createElement('span');
+    realmInd.className = 'chip-ind';
+    el.appendChild(realmInd);
+    realmBtns = REALM_CHIPS.map(([k, l]) => {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'chip';
+      b.setAttribute('data-realm', k);   // 用属性而不是 dataset：点击委托靠 closest('[data-realm]')
+      b.textContent = l;
+      const n = document.createElement('span');
+      n.className = 'n';
+      b.appendChild(n);
+      el.appendChild(b);
+      return { k, el: b, n };
+    });
+  }
   const n = realmAccountCounts();
   const known = n.all > 0; // 账号列表还没到手时先不显示计数，免得出现"全部 0"
-  el.innerHTML = [['all', '全部'], ['cn', '国服'], ['global', '国际服']].map(([k, l]) =>
-    '<button type="button" class="chip' + (panelRealm === k ? ' on' : '') + '" data-realm="' + k + '">' +
-    l + (known ? '<span class="n">' + n[k] + '</span>' : '') + '</button>').join('');
+  for (const it of realmBtns) {
+    it.el.classList.toggle('on', panelRealm === it.k);
+    it.n.textContent = known ? String(n[it.k]) : '';
+  }
+  moveRealmInd();
+}
+
+// moveRealmInd 把滑动胶囊挪到当前选中项（过渡由 CSS 承担）。
+//
+// 只在「选中项或计数」变化时才读布局：offsetLeft/offsetWidth 会强制同步布局，而本函数
+// 每 5 秒会被轮询间接触发一次——数据没变时必须一次布局都不读。
+let _realmIndKey = '';
+function moveRealmInd() {
+  if (!realmInd || !realmBtns) return;
+  const n = realmAccountCounts();
+  const key = panelRealm + '|' + n.all + ',' + n.cn + ',' + n.global;
+  if (key === _realmIndKey) return;
+  const first = !_realmIndKey;
+  _realmIndKey = key;
+  const cur = realmBtns.filter(b => b.k === panelRealm)[0] || realmBtns[0];
+  if (first) realmInd.style.transition = 'none';   // 首次定位不演：否则一打开页面胶囊从左边滑过来
+  realmInd.style.width = (cur.el.offsetWidth || 0) + 'px';
+  realmInd.style.transform = 'translateX(' + (cur.el.offsetLeft || 0) + 'px)';
+  if (first && typeof requestAnimationFrame === 'function') {
+    requestAnimationFrame(() => { realmInd.style.transition = ''; });
+  }
 }
 
 // applyPanelRealm 把开关落到"当前视图"的筛选上：各视图自己那套域 chips 与开关同口径。
@@ -70,14 +128,33 @@ function applyPanelRealm() {
     renderMdChips(mdCache.length);
     applyMdFilter();
   } else if (view === 'packages') {
-    loadPackages();
+    // 积分构成的数据**本身不分域**（服务端 /panel/api/packages 没有 realm 参数），切域只是
+    // 换一批账号来看——所以不重查上游（那是逐账号查询，面板里最慢的一条路），
+    // 直接用手里的数据按新域重画。
+    if (!paintNow('packages')) loadPackages();
   } else if (view === 'usage') {
+    // 用量是**服务端按域过滤**的（这样合计与明细口径一致），换域必须重查；查回来之前
+    // 不能拿旧域的数字充数——明确清空并提示，而不是让旧行留着（看着像「切了没反应」）。
+    if (useDataRealm !== panelRealm) {
+      $('useBody').innerHTML = dashEmpty(8, '正在按「' + realmLabel() + '」重新读取…');
+      $('useCount').textContent = '';
+      $('useNote').textContent = '读取中…';
+    }
     loadUsage();
   } else if (view === 'dashboard') {
-    loadStats();     // 仪表盘按域取数（by_realm），切域后要重画
-    loadTrend(true); // 趋势图按域聚合（审计流水），force 绕过 60 秒节流
+    // stats 里本来就带 by_realm 分域切片 → 先用手里的原始 payload 切一刀重画（秒开），
+    // 再后台对齐一次（顺带把趋势按域重拉，force 绕过 60 秒节流）。
+    renderDashFromRaw();
+    loadStats();
+    loadTrend(true);
   } else if (view === 'keys') {
-    loadKeys();      // 密钥的「最近 7 天」用量列按域统计
+    // 密钥的「最近 7 天」用量列按域统计（服务端算），同用量页：换域要重查，
+    // 查回来之前不拿旧域的数字充数。
+    if (keysRealm !== panelRealm) {
+      $('keysBody').innerHTML = dashEmpty(5, '正在按「' + realmLabel() + '」重新读取…');
+      $('keysNote').textContent = '读取中…';
+    }
+    loadKeys();
   }
 }
 
@@ -114,6 +191,10 @@ function dashRealmNote(rv, s) {
 // 纯类名切换（CSS 负责收起其余卡片），不发请求、不动数据。
 function applyCnOnlyViews() {
   const cnOnly = panelRealm === 'global';
+  // 切到国际服时停掉任务队列的 3 秒轮询：它打的全是 CN 端点（开学季/成长任务），
+  // 国际服没有这些体系——继续轮询等于对着一个必然报错的接口空转。
+  // 切回国服后进入任务中心会重新拉一次（go() 里 pollQueueOnce），不影响使用。
+  if (cnOnly && queueTimer) { clearInterval(queueTimer); queueTimer = null; }
   for (const id of ['view-checkin', 'view-taskcenter']) {
     const el = $(id);
     if (!el) continue;
@@ -1479,11 +1560,47 @@ $('btnCopyKey').onclick = () => {
   copyText(k, '密钥已复制');
 };
 
-// _dashSig 上一次渲染的数据签名。仪表盘 5 秒轮询一次，但绝大多数轮询之间
-// 数据一个字节都没变——每次都把全部 KPI / 图表 / 表格 innerHTML 重建一遍，
-// 是整页最大的性能开销（布局抖动 + 悬停态被打断）。签名相同就整页跳过，
-// 只把会随时间走的「X 前刷新」交给粗粒度字段（按分钟取整）自然触发重画。
-let _dashSig = '';
+// dashRaw 最近一次 /panel/api/stats 的原始 payload。切域时在客户端重新切片即可
+//（payload 里本来就带 by_realm），不必重查——这是仪表盘切域「秒开」的关键。
+let dashRaw = null;
+
+// dashStats 按当前域开关把原始 payload 切成「该看的那份」：域视图下把 Totals/Models/
+// Keys/Buckets 整块替换成该域的分域切片（同形，渲染代码一行不用改）。缺失（后端未升级/
+// 该域还没有分域数据）则回落全量，并在提示里说明——不给假数据。
+function dashStats() {
+  const s = dashRaw || {};
+  const rv = (panelRealm !== 'all' && s.by_realm) ? s.by_realm[panelRealm] : null;
+  const out = rv ? Object.assign({}, s, {
+    totals: rv.totals, models: rv.models, keys: rv.keys, buckets: rv.buckets,
+    // 积分口径：余额/消耗/实测比率/净速率/到期批次都换成该域的
+    //（算法与池级共用 creditsViewOf，只是范围限定在该域账号上）。
+    credits: rv.credits || s.credits,
+  }) : s;
+  dashRealmNote(rv, out);
+  return out;
+}
+
+// dashSig 仪表盘的数据签名：影响渲染的全部字段。age_sec 按 60s 取整——标签本来就显示
+//「X 分钟前」，秒级变化不值得一次整页重画；uptime 不进签名（运行时长在顶栏，由 applyStatus 刷）。
+function dashSig(s) {
+  const c = s.credits || {};
+  const acct = ((overviewData && overviewData.accounts) || [])
+    .map(a => a.uid + ':' + (a.credits || 0) + ':' + (a.disabled ? 1 : 0)).join(',');
+  return JSON.stringify([panelRealm, s.totals, s.models, s.keys, s.buckets,
+    { r: c.remain, u: c.used, sp: c.samples, pk: c.per_mtoken, et: c.est_tokens,
+      bph: c.burn_per_hour, span: c.burn_span_sec, net: c.burn_net,
+      eb: c.expiring_batches, ed: c.expiring_days,
+      am: c.age_sec == null ? -1 : Math.floor(c.age_sec / 60) },
+    acct]);
+}
+
+// renderDashFromRaw 用手里已有的原始 payload 重画仪表盘（不发请求）。
+function renderDashFromRaw() {
+  if (!dashRaw) return false;
+  const s = dashStats();
+  renderIfChanged('dashboard', dashSig(s), () => renderDashboard(s));
+  return true;
+}
 
 async function loadStats() {
   fillAccess();
@@ -1494,40 +1611,67 @@ async function loadStats() {
     const d = await api('stats');
     // 密钥名跟着 stats 一起来（指纹 → 名字），渲染前先落地。
     keyNames = d.key_names || {};
-    let s = d.stats || {};
-    // 域视图：切到某一域时，把该域的分域视图**整块替换**全量口径（Totals/Models/Keys/Buckets
-    // 同形，渲染代码一行不用改）。缺失（后端未升级/该域还没有分域数据）则回落全量，并在提示里
-    // 说明——不给假数据。
-    const rv = (panelRealm !== 'all' && s.by_realm) ? s.by_realm[panelRealm] : null;
-    if (rv) {
-      s = Object.assign({}, s, {
-        totals: rv.totals, models: rv.models, keys: rv.keys, buckets: rv.buckets,
-        // 积分口径（第 3 步）：余额/消耗/实测比率/净速率/到期批次都换成该域的
-        //（算法与池级共用 creditsViewOf，只是范围限定在该域账号上）。
-        credits: rv.credits || s.credits,
-      });
-    }
-    dashRealmNote(rv, s);
-    const c = s.credits || {};
-    // 签名 = 影响渲染的全部数据。age_sec 按 60s 取整：标签本来就显示「X 分钟前」，
-    // 秒级变化不值得一次整页重画；uptime 不进签名（运行时长在顶栏，由 applyStatus 刷）。
-    const acctSig = ((overviewData && overviewData.accounts) || [])
-      .map(a => a.uid + ':' + (a.credits || 0) + ':' + (a.disabled ? 1 : 0)).join(',');
-    const sig = JSON.stringify([panelRealm, s.totals, s.models, s.keys, s.buckets,
-      { r: c.remain, u: c.used, sp: c.samples, pk: c.per_mtoken, et: c.est_tokens,
-        bph: c.burn_per_hour, span: c.burn_span_sec, net: c.burn_net,
-        eb: c.expiring_batches, ed: c.expiring_days,
-        am: c.age_sec == null ? -1 : Math.floor(c.age_sec / 60) },
-      acctSig]);
-    if (sig !== _dashSig) {
-      _dashSig = sig;
-      renderDashboard(s);
-    }
+    dashRaw = d.stats || {};
+    renderDashFromRaw();
     $('dashNote').textContent = '累计用量 · 重启保留 · ' + clock(Date.now()) + ' 刷新';
   } catch (e) {
     $('dashNote').textContent = '读取失败：' + e.message;
   }
 }
+
+/* ── 视图渲染的公共设施 ─────────────────────────────────────────────
+   面板 10 个视图的数据都是整块 innerHTML 重建。三条纪律，都是为了让「切换」不再卡：
+   1) 数据没变就不重绘（签名相同 → 跳过）——5 秒轮询每 tick 把表重建一遍是最大的浪费；
+   2) 不可见的视图不重绘（数据照常落内存，进页面时再画）——切页时不做白工的 DOM；
+   3) 进页面先用手里的数据画一遍，再后台刷新（stale-while-revalidate）——
+      动画才有内容可演，不会「先空/先旧、数据到了再跳变」。 */
+const viewSig = {};     // 视图 → 上次渲染用的数据签名
+const viewDirty = {};   // 视图 → 内存里有比 DOM 更新的数据，等它被看见时再画
+
+// renderIfChanged 签名变了才重绘。sig 传 '' 表示强制重绘。返回是否真的画了。
+function renderIfChanged(v, sig, render) {
+  if (sig && viewSig[v] === sig) return false;
+  viewSig[v] = sig || '';
+  viewDirty[v] = false;
+  render();
+  return true;
+}
+
+// markDirty 数据变了但这个视图不可见：只记一笔，等进页面时再画。
+function markDirty(v, sig) { if (viewSig[v] !== sig) viewDirty[v] = true; }
+
+// paintNow 用当前内存里的数据把这个视图画出来（不判断脏、不发请求）。
+// 返回 false = 手里还没有能画的数据（调用方照旧显示加载态/空态）。
+function paintNow(v) {
+  if (v === 'accounts') { if (!overviewData) return false; renderAccounts(overviewData.accounts || []); return true; }
+  if (v === 'checkin') { if (!overviewData) return false; renderCheckin(overviewData.accounts || []); return true; }
+  if (v === 'dashboard') return renderDashFromRaw();
+  // 用量/密钥是**服务端按域过滤**的：手里的数据属于别的域时不能拿来充数（会显示错域的数字）。
+  if (v === 'usage') { if (!useData || useDataRealm !== panelRealm) return false; renderUsage(); return true; }
+  if (v === 'keys') { if (!keysData || keysRealm !== panelRealm) return false; renderKeys(); return true; }
+  // 积分构成的数据不分域（服务端没有 realm 参数），手里有就能直接画。
+  if (v === 'packages') { if (!pkData) return false; renderPackages(pkData); return true; }
+  if (v === 'models') { if (!mdCache.length) return false; renderModels(); return true; }
+  if (v === 'logs') { if (!logLines.length) return false; paintLogs(); return true; }
+  // 任务中心不在这里：它进页面时走 loadSchoolStatus(true)（quiet，不清空），旧矩阵会一直
+  // 显示到新数据到达——本身就是缓存优先，不需要额外补一层。
+  // 设置页的表单 DOM 一直在（字段是原地改值，不是整块重建），有配置就算「能画」。
+  if (v === 'config') return !!cfgLoaded;
+  return false;
+}
+
+// paintView 进页面时调用：只有「内存里的数据比 DOM 新」才重画。
+// 注意不强制重画——DOM 里本来就是上次那份数据的渲染结果，重画只是白烧 CPU 且会让
+// 刚播的入场动画从头再来一次。
+function paintView(v) {
+  if (!viewDirty[v]) return false;
+  if (!paintNow(v)) return false;
+  viewDirty[v] = false;
+  return true;
+}
+
+// realmLabel 域开关的显示名（提示文案里用）。
+function realmLabel() { return panelRealm === 'global' ? '国际服' : panelRealm === 'cn' ? '国服' : '全部'; }
 
 /* ── 路由 ─────────────────────────────────────────────────────────── */
 const TITLES = { dashboard: '仪表盘', accounts: '账号', checkin: '任务管理', taskcenter: '任务中心', packages: '积分构成', models: '模型', keys: '密钥', config: '设置', logs: '运行日志', usage: '请求审计' };
@@ -1538,6 +1682,9 @@ function go(v) {
   $('ttl').textContent = TITLES[v];
   // 「添加账号」只出现在账号管理。签到页不管号，总览更不该出现。
   $('btnAdd').hidden = v !== 'accounts';
+  // 先用手里的数据把这个视图画出来（有数据就秒开，入场动画也有内容可演），
+  // 再触发下面的刷新——刷新回来若数据没变，签名守卫会跳过重画，画面不会跳。
+  paintView(v);
   if (v === 'dashboard') loadStats();
   if (v === 'accounts' || v === 'checkin') loadOverview(true);
   // 进入页面时把跨页持久的域开关落到该页筛选上（否则"国际服模式"下进账号页会看到两域的号）
@@ -1555,7 +1702,9 @@ function go(v) {
   if (v === 'taskcenter' && panelRealm !== 'global') { loadSchoolStatus(true); pollQueueOnce(); }
   if (v === 'checkin' || v === 'taskcenter') applyCnOnlyViews();
   if (v === 'packages') loadPackages();
-  if (v === 'models' && !$('mdBody').children.length) loadModels();
+  // 用数据判断「要不要拉模型目录」，而不是用 DOM 里有没有行：DOM 是渲染结果，
+  // 拿它当缓存标记会让「空目录」每次进来都重查一遍。
+  if (v === 'models' && !mdCache.length) loadModels();
   if (v === 'config') loadConfig();
   if (v === 'logs') loadLogs();
   if (v === 'usage') loadUsage();
@@ -1653,7 +1802,11 @@ function visibleAccounts(list) {
   else if (accSort === 'name') {
     out.sort((a, b) => (a.alias || a.nickname || a.uid || '').localeCompare(b.alias || b.nickname || b.uid || '', 'zh'));
   } else {
-    out.sort((a, b) => healthOf(b).score - healthOf(a).score);
+    // 健康分先各算一次：原来写成 healthOf(b).score - healthOf(a).score，比较器每次比较
+    // 都要算两遍（n log n 次比较 → 2·n·log n 次调用，每次含 new Date 与字符串拼接）。
+    // 号少时看不出来，号多了就是切页/轮询那一下的顿挫来源。
+    const sc = new Map(out.map(s => [s, healthOf(s).score]));
+    out.sort((a, b) => sc.get(b) - sc.get(a));
   }
   return out;
 }
@@ -1703,8 +1856,18 @@ function probeTitle(s) {
     (s.probe_err ? '原因：' + s.probe_err : '');
 }
 
+// accViewSig 账号表渲染所依赖的**一切**：数据 + 这一页自己的筛选/搜索/排序。
+// 签名必须把筛选算进去——否则「切页时按域重设筛选」这种「数据没变、筛选变了」的情况
+// 会被签名守卫跳过，表格就停在旧筛选上（看着像切了没反应）。
+function accViewSig() { return acctSig(accList) + '|' + accFilter + '|' + accQuery + '|' + accSort; }
+// ckViewSig 签到表的签名（同口径）。
+function ckViewSig() { return acctSig(ckList) + '|' + ckFilter + '|' + ckQuery; }
+
 function renderAccounts(list) {
   if (list) accList = list;
+  // 记下「这次画的是哪份数据 + 哪组筛选」：所有调用点（轮询/切页/改筛选）都靠它去重，
+  // 于是同一份内容只会被画一次。
+  viewSig.accounts = accViewSig(); viewDirty.accounts = false;
   const tb = $('accBody');
   updateDeadAccountButtons(accList); // 空池时 n=0 → 两个按钮自动隐藏
   renderAccChips(accList);
@@ -1834,13 +1997,27 @@ async function loadStatus(quiet) {
   catch (e) { if (!quiet) toast(e.message, 'err'); }
 }
 
+// acctSig 账号列表的数据签名：只取影响渲染的字段（含签到页要用的 today_checked）。
+// 用它把「数据没变」的轮询整轮跳掉——5 秒一次、每次上千个节点重建，是最大的浪费。
+function acctSig(list) {
+  return (list || []).map(a => [a.uid, a.credits || 0, a.disabled ? 1 : 0, a.in_flight || 0,
+    a.success_count || 0, a.err_total || 0, a.probe_at || '', a.probe_ok ? 1 : 0,
+    a.today_checked ? 1 : 0, a.cool_remaining_sec || 0, a.breaker_until || ''].join(':')).join(',');
+}
+
 async function loadOverview(quiet) {
   try {
     const d = await api('overview');
     applyStatus(d);
     $('accNote').textContent = d.in_flight_full ? d.in_flight_full + ' 个账号并发已满' : '';
-    renderAccounts(d.accounts || []);
-    renderCheckin(d.accounts || []);
+    accList = d.accounts || [];
+    ckList = accList;
+    // 两张表共用这一份数据，但各自**只在被看见时**重画：切到账号页却顺手把隐藏的签到表
+    // 也重建一遍是纯白工（两张表加起来上千个节点）。不可见时只记一笔，进页面时再画。
+    if (view === 'accounts') renderIfChanged('accounts', accViewSig(), () => renderAccounts(accList));
+    else markDirty('accounts', accViewSig());
+    if (view === 'checkin') renderIfChanged('checkin', ckViewSig(), () => renderCheckin(ckList));
+    else markDirty('checkin', ckViewSig());
   } catch (e) { if (!quiet) toast(e.message, 'err'); }
 }
 
@@ -1882,6 +2059,7 @@ function renderCkChips(list) {
 }
 function renderCheckin(list) {
   if (list) ckList = list;
+  viewSig.checkin = ckViewSig(); viewDirty.checkin = false;
   const tb = $('ckBody');
   if (!tb) return;
   const signed = ckList.filter(s => s.today_checked).length;
@@ -2280,8 +2458,7 @@ async function loadModels() {
     // 缓存到 window 外的模块级变量不可行（此函数可能被重复调用），直接每次重查；
     // 筛选只是视图层过滤，不重新打上游。
     mdCache = all;
-    renderMdChips(all.length);
-    applyMdFilter();
+    renderIfChanged('models', mdViewSig(), renderModels);
     $('mdNote').textContent = all.length + ' 个模型 · 已刷新降级缓存';
   } catch (e) {
     tb.innerHTML = '<tr><td colspan="7"><div class="empty">' + esc(e.message) + '</div></td></tr>';
@@ -2349,9 +2526,16 @@ function renderDupRows(tb) {
 // applyMdFilter 按 mdFilter 过滤 mdCache 并渲染表体；徽标分色与账号页同款
 // （国服蓝 realm-tag / 国际服紫 realm-tag global）。模型 id 显示裸名（去域前缀），
 // 域归属看徽标——前缀是内部路由键，对用户是噪音。
+// mdViewSig 模型表的签名：目录条数 + 当前域筛选（含「重复模型」视图）。
+function mdViewSig() { return mdCache.length + '|' + mdFilter + '|' + panelRealm; }
+
+// renderModels 模型表的渲染入口（筛选条 + 表体一起画）。
+function renderModels() { renderMdChips(mdCache.length); applyMdFilter(); }
+
 function applyMdFilter() {
   const tb = $('mdBody');
   if (!tb) return;
+  viewSig.models = mdViewSig(); viewDirty.models = false;
   if (mdFilter === 'dup') { renderDupRows(tb); return; }
   // 域视图 = 该域**自己的目录**（按条目所属域过滤）：重名模型在两个域各有条目（各带本域倍率
   // 与上下文窗口），所以两边都会出现一次——这正是"国服 x0.03 / 国际服免费"这类对比要看的东西。
@@ -2491,9 +2675,15 @@ function renderLogChips(lines) {
   }).join('');
 }
 
+// logViewSig 日志视图的签名：数据（行数与最后一行）+ 频道筛选 + 搜索词。
+function logViewSig() {
+  return logLines.length + '|' + (logLines[logLines.length - 1] || '') + '|' + logFilter + '|' + logQuery;
+}
+
 function paintLogs() {
   const box = $('logBox');
   if (!box || box.dataset.cleared === '1') return;
+  viewSig.logs = logViewSig(); viewDirty.logs = false;
   renderLogChips(logLines);
   const vis = visibleLogs(logLines);
   box.innerHTML = vis.length
@@ -2501,7 +2691,7 @@ function paintLogs() {
     : '<span style="color:#6b7280">' + (logLines.length ? '没有符合筛选的日志' : '暂无日志（服务运行中，等任务触发）') + '</span>';
   const m = $('termMeta');
   if (m) m.textContent = vis.length === logLines.length
-    ? logLines.length + ' 行 · 自动刷新 1.5s'
+    ? logLines.length + ' 行 · 自动刷新 ' + Math.round(POLL_MS / 1000) + 's'
     : vis.length + ' / ' + logLines.length + ' 行';
   if ($('logFilterNote')) $('logFilterNote').textContent = vis.length === logLines.length ? '' : '已筛选';
 }
@@ -2755,8 +2945,13 @@ async function loadLogs() {
     logLines = lines;
     updateTaskProgress(lines);
     if (cleared) { renderLogChips(lines); return; }
-    paintLogs();
-    if (logPin && atEnd) box.scrollTop = box.scrollHeight;
+    // 日志最多 500 行、每行要跑几个正则 + 逐行查账号名：数据没变就别重画
+    //（轮询每 5 秒来一次，重画还会打断正在读的那一段）。
+    if (view === 'logs') {
+      if (renderIfChanged('logs', logViewSig(), paintLogs) && logPin && atEnd) box.scrollTop = box.scrollHeight;
+    } else {
+      markDirty('logs', logViewSig());
+    }
   } catch (e) { /* 概览已提示 */ }
 }
 $('btnLogPin').onclick = () => {
@@ -2795,6 +2990,9 @@ $('btnLogClear').onclick = () => {
    换筛选条件零延迟，也省得用户每点一下都等一轮网络。                      */
 let useData = null;       // 最近一次 /panel/api/usage 响应
 let useDay = '';          // 当前选中日期（YYYY-MM-DD）
+// useDataRealm 上面那份 payload 是**按哪个域**取的。用量是服务端按域过滤的，
+// 换域后旧数据不能拿来充数（会显示错域的数字），所以记下它属于哪个域。
+let useDataRealm = null;
 let useUser = '';         // 密钥（用户）筛选，'' = 全部
 let useModel = '';        // 模型筛选
 let useAccount = '';      // 出口账号筛选
@@ -3078,14 +3276,9 @@ function renderFilterMenu() {
   // 判据必须用按钮的**右边缘**到窗口右边的距离，不能只看左边缘：
   // 菜单本身有宽度（≈180）+ 子菜单（≈200）+ 间隙，加起来约 400px。
   // 之前判据写反了——"靠右" 时反而往右展开，正好顶出窗口。
-  const wrap = $('fltWrap');
-  let flip = false;
-  if (wrap && wrap.getBoundingClientRect && typeof window !== 'undefined') {
-    const vw = window.innerWidth || 1200;
-    const r = wrap.getBoundingClientRect();
-    flip = (vw - r.right) < 400;
-  }
-  menu.className = 'pop flt-menu' + (flip ? ' flip' : '');
+  // flip 由 openFilterMenu() 在打开那一刻算好（见那里的注释）：渲染路径里读布局会强制
+  // 同步布局，而本函数在每次筛选变化/数据刷新时都会被调用，是可见顿挫的来源之一。
+  menu.className = 'pop flt-menu' + (fltFlip ? ' flip' : '');
 
   menu.innerHTML = USE_FILTER_CATS.map(c => {
     const cur = fltCurrent(c.k);
@@ -3135,7 +3328,16 @@ function clearUseFilters() {
   renderUsage();
 }
 
+// fltFlip 子菜单往右还是往左展开。**只在打开菜单时算一次**：判据要用按钮的右边缘到窗口
+// 右边的距离（菜单 ≈180 + 子菜单 ≈200 + 间隙，加起来约 400px），这需要读布局——
+// 而读布局放在渲染路径里会强制同步布局（每次筛选变化都来一次），所以挪到这里。
+let fltFlip = false;
 function openFilterMenu() {
+  const wrap = $('fltWrap');
+  if (wrap && wrap.getBoundingClientRect && typeof window !== 'undefined') {
+    const vw = window.innerWidth || 1200;
+    fltFlip = (vw - wrap.getBoundingClientRect().right) < 400;
+  }
   fltOpenCat = '';
   $('fltMenu').hidden = false;
   $('btnUseFilter').setAttribute('aria-expanded', 'true');
@@ -3184,6 +3386,7 @@ function useRowHTML(r) {
 
 function renderUsage() {
   if (!useData) return;
+  viewSig.usage = useViewSig(); viewDirty.usage = false;
   const days = useData.days || [];
   const opts = days.slice();
   if (useDay && opts.indexOf(useDay) < 0) opts.unshift(useDay); // 有筛选但那天没文件
@@ -3223,6 +3426,15 @@ function renderUsage() {
     (acts.length ? ' · ' + acts.join(' + ') : '');
 }
 
+// useViewSig 用量页的签名：数据（日期/条数/汇总）+ 域 + 这一页自己的全部筛选。
+// 筛选必须进签名——筛选变化是原地重画（不重新请求），签名不跟着变就会被守卫跳过。
+function useViewSig() {
+  if (!useData) return '';
+  return [panelRealm, useData.date || '', (useData.rows || []).length,
+    JSON.stringify(useData.summary || {}), useUser, useModel, useAccount, useMode,
+    useStatus, useQuery].join('|');
+}
+
 async function loadUsage(day) {
   if (day) useDay = day;
   // 域开关跟随：审计的汇总与明细都由后端按域过滤（口径一致，不会出现合计与明细对不上）
@@ -3233,11 +3445,12 @@ async function loadUsage(day) {
     const d = await api('usage' + q);
     useData = d;
     useDay = d.date;
+    useDataRealm = panelRealm;   // 记下这份数据属于哪个域（切域时据此判断能不能直接用）
     // 换天后旧的筛选可能指向不存在的东西，会显示"空表但不知道为什么"，重置。
     useUser = ''; useModel = ''; useAccount = ''; useMode = 'all'; useStatus = 'all';
     fltOpenCat = '';
     closeFilterMenu();
-    renderUsage();
+    renderIfChanged('usage', useViewSig(), renderUsage);
   } catch (e) {
     $('useNote').textContent = '读取失败';
     $('useCount').textContent = '';
@@ -3334,6 +3547,7 @@ $('btnUseCsv').onclick = () => {
    「最近 7 天」这一列来自「请求审计」，是这一页真正的价值所在：
    删密钥之前唯一该问的问题是"还有没有人在用"，而这个答案只有审计流水知道。 */
 let keysData = null;
+let keysRealm = null;     // keysData 属于哪个域（「最近 7 天」用量列是服务端按域算的）
 let keyDlgMode = 'new'; // 'new' | 'edit' | 'done'
 let keyDlgID = '';      // edit/分享/删除 的目标 id
 let keyDlgKey = '';     // done 态要复制的完整密钥
@@ -3348,7 +3562,8 @@ async function loadKeys() {
   try {
     const d = await api('keys' + keyRealmQ);
     keysData = d;
-    renderKeys();
+    keysRealm = panelRealm;
+    renderIfChanged('keys', keyViewSig(), renderKeys);
   } catch (e) {
     $('keysNote').textContent = '';
     $('keysBody').innerHTML = dashEmpty(5, '读取失败：' + e.message);
@@ -3388,8 +3603,14 @@ function keyRowHTML(k) {
     '</tr>';
 }
 
+// keyViewSig 密钥表的签名：域 + 密钥列表（「最近 7 天」用量列是服务端按域算的）。
+function keyViewSig() {
+  return panelRealm + '|' + JSON.stringify((keysData && keysData.keys) || []);
+}
+
 function renderKeys() {
   if (!keysData) return;
+  viewSig.keys = keyViewSig(); viewDirty.keys = false;
   const ks = keysData.keys || [];
   $('keysBody').innerHTML = ks.length
     ? ks.map(keyRowHTML).join('')
@@ -3882,6 +4103,9 @@ $('btnRestart').onclick = async () => {
 
 /* ── 轮询 ─────────────────────────────────────────────────────────── */
 function refreshVisible() {
+  // 标签页在后台时不刷：看不见的轮询只是白耗电、白占上游连接，回来时补一次就够了
+  //（visibilitychange 里立即刷一次）。
+  if (document.hidden) return;
   // accounts / checkin 的 loadOverview 内部已经刷过全局状态，别重复请求。
   if (view === 'accounts' || view === 'checkin') loadOverview(true);
   else {
@@ -3898,9 +4122,12 @@ function refreshVisible() {
 function start() {
   loadOverview(true);
   if (refTimer) clearInterval(refTimer);
-  refTimer = setInterval(refreshVisible, 5000);
+  refTimer = setInterval(refreshVisible, POLL_MS);
   checkAuthGate();
 }
+// 从后台切回前台时立刻补一次（否则最多要等一个 POLL_MS 才看到新数据，
+// 而用户刚回到页面时正是最需要「现在是新的」的时刻）。
+document.addEventListener('visibilitychange', () => { if (!document.hidden) refreshVisible(); });
 async function checkAuthGate() {
   try { await api('overview'); }
   catch (e) { if (String(e.message).includes('密钥') || String(e.message).includes('api_key')) return; }
@@ -4595,6 +4822,9 @@ function startQueuePolling() {
    完全一致的账号，余额可能差上千——差别只在包里。这里把逐包明细摊开，并给每个
    包名一个稳定配色，跨账号对比时同色即同类。 */
 
+// pkData 最近一次积分构成的响应。数据本身不分域，所以切域只需换一批账号重画，
+// 不必重查上游（那是逐账号查询，面板里最慢的一条路）。
+let pkData = null;
 const PK_COLORS = ['#4f8cff', '#25b08b', '#e8a33d', '#c96bd6', '#e2607a',
                    '#5aa9e6', '#8fbf3f', '#b58b5a', '#7d8fa8', '#d4785c'];
 
@@ -4774,18 +5004,23 @@ function renderPackages(d) {
   }).join('');
 }
 
-async function loadPackages() {
-  $('pkSummary').innerHTML = '<div class="empty">查询中…（逐账号向上游实时查询）</div>';
-  $('pkDetail').innerHTML = '';
+async function loadPackages(force) {
+  // 手里已有结果时**不清空**：清空再等一轮上游查询是最没必要的闪烁（切域时数据本身没变，
+  // 只是换一批账号来看）。首次进入、或点了「重新查询」才显示加载态。
+  if (force || !pkData) {
+    $('pkSummary').innerHTML = '<div class="empty">查询中…（逐账号向上游实时查询）</div>';
+    $('pkDetail').innerHTML = '';
+  }
   try {
     const d = await api('packages');
+    pkData = d;
     renderPackages(d);
   } catch (e) {
     $('pkSummary').innerHTML = '<div class="empty">读取失败：' + esc(e.message) + '</div>';
   }
 }
 
-if ($('btnPkgReload')) $('btnPkgReload').onclick = loadPackages;
+if ($('btnPkgReload')) $('btnPkgReload').onclick = () => loadPackages(true);
 function boot() {
   const hash = (location.hash || '#dashboard').slice(1);
   go(hash in TITLES ? hash : 'dashboard');

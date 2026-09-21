@@ -132,6 +132,8 @@ function mkCb(checked) {
 }
 
 const notifications = [];
+// timerLog 记录 setInterval 的间隔与 clearInterval 的 id（见上面 sandbox 的说明）。
+const timerLog = { set: [], clear: [] };
 let notifyPerm = 'granted';
 
 // docHandlers 记录挂在 document 上的事件处理器（提示浮层要靠它被调到）。
@@ -147,7 +149,11 @@ const sandbox = {
   console,
   // 定时器不真跑：这些回调（通知自动关闭、resize debounce）与本测试断言无关，
   // 真调度只会让 node 为了等一个 8s 定时器白挂 8 秒才退出。
-  setTimeout: () => 0, clearTimeout: () => {}, setInterval: () => 0, clearInterval: () => {},
+  // 但 setInterval 要返回**真值 id** 并记录 clearInterval：队列轮询在切到国际服时
+  // 会被清掉，那条契约只有在 queueTimer 是假值时才断言得了（恒返回 0 就永远为假）。
+  setTimeout: () => 0, clearTimeout: () => {},
+  setInterval: (fn, ms) => { timerLog.set.push(ms); return timerLog.set.length; },
+  clearInterval: id => { timerLog.clear.push(id); },
   Date, Math, JSON, Object, Array, String, Number, Boolean, RegExp, Error, Promise, Set, Map,
   encodeURIComponent, decodeURIComponent, parseInt, parseFloat, isNaN,
   document: {
@@ -197,6 +203,7 @@ sandbox.Event = class Event {
   constructor(type, opts) { this.type = type; this.bubbles = !!(opts && opts.bubbles); }
 };
 sandbox.__docHandlers = docHandlers;
+sandbox.__timerLog = timerLog;
 // 通知开关默认打开，方便断言通知真的被触发
 sandbox.localStorage.setItem('wb2api.notify', '1');
 
@@ -283,6 +290,18 @@ const trailer = `
   // 这里钉住「选域 → 带 realm 的 login/start」这条契约。
   // 选哪个 radio 由 harness 侧 __setAddRealm 控制（querySelector 桩）。
   openAdd, startAddLogin, pollLogin,
+  // 面板切换优化（缓存优先 / 域开关原地更新 / 轮询收敛）：
+  renderIfChanged, markDirty, paintView, paintNow,
+  renderRealmSwitch, setPanelRealm, applyPanelRealm, applyCnOnlyViews,
+  realmBtn: k => (realmBtns || []).filter(b => b.k === k)[0],
+  realmInd: () => realmInd,
+  viewDirtyState: v => !!viewDirty[v],
+  setView: v => { view = v; },
+  getView: () => view,
+  setQueueTimer: v => { queueTimer = v; },
+  queueTimerValue: () => queueTimer,
+  pollMs: POLL_MS,
+  accViewSig, ckViewSig, logViewSig, mdViewSig, useViewSig, keyViewSig,
   // 图表悬停
 };
 `;
@@ -1656,6 +1675,95 @@ console.log('controls');
   await T.pollLogin();
   ok(getEl('addDone').textContent.includes('（国际版）'), 'global 账号完成文案标「国际版」');
   ok(getEl('addDone').textContent.includes('新号'), '完成文案带昵称');
+
+  /* ── 面板切换优化：缓存优先 / 域开关原地更新 / 轮询收敛 ───────────────
+     这一段盯的是「切页为什么卡」的三条根因，都是行为契约而非像素：
+     1) 数据没变就不重绘（否则 5 秒轮询每 tick 重建上千个节点）；
+     2) 不可见的视图不重绘，进页面时再画（否则切页做白工）；
+     3) 域开关不重建 DOM（重建会吃掉 CSS 过渡与按压反馈）。 */
+  console.log('panelPerf');
+
+  // 1) 签名守卫：同一个签名只画一次
+  let drew = 0;
+  T.renderIfChanged('utest', 'sig-a', () => drew++);
+  T.renderIfChanged('utest', 'sig-a', () => drew++);
+  eq(drew, 1, '签名相同 → 不重绘');
+  T.renderIfChanged('utest', 'sig-b', () => drew++);
+  eq(drew, 2, '签名变化 → 重绘');
+  T.renderIfChanged('utest', '', () => drew++);
+  eq(drew, 3, 'sig 传空串 → 强制重绘');
+
+  // 2) 脏标记 + paintView：不可见时只记脏，进页面才补画，画过不重复画
+  T.setOverview({ session_dead_threshold: 3, accounts: [{ uid: 'u1', credits: 5 }] });
+  T.setView('accounts');
+  T.markDirty('accounts', 'ov-1');
+  eq(T.paintView('accounts'), true, '不可见期间攒下的数据，进页面时补画');
+  eq(T.paintView('accounts'), false, '画过之后不再重复画（DOM 已是最新）');
+  T.setView('logs');
+  T.markDirty('accounts', 'ov-2');
+  eq(T.viewDirtyState('accounts'), true, '不可见时数据变了 → 只记脏，不画');
+
+  // 3) 域开关：不重建 DOM、计数原地更新、胶囊跟着走
+  T.renderRealmSwitch();
+  const cnBtn = T.realmBtn('cn'), cnEl = cnBtn.el, cnN = cnBtn.n;
+  T.renderRealmSwitch();
+  ok(T.realmBtn('cn').el === cnEl, '域开关不重建 DOM（节点同一性保持）');
+  ok(T.realmBtn('cn').n === cnN, '计数字节点也保持同一个（原地改文本）');
+  T.setOverview({ accounts: [{ uid: 'a', realm: 'cn' }, { uid: 'b', realm: 'global' }] });
+  T.renderRealmSwitch();
+  eq(cnBtn.n.textContent, '1', '计数原地更新（国服 1 个）');
+  eq(T.realmBtn('all').n.textContent, '2', '全部计数 = 2');
+
+  cnEl.offsetLeft = 70; cnEl.offsetWidth = 52;
+  T.realmBtn('global').el.offsetLeft = 130; T.realmBtn('global').el.offsetWidth = 64;
+  T.setPanelRealm('cn');
+  eq(T.realmInd().style.transform, 'translateX(70px)', '胶囊平移到选中项');
+  eq(T.realmInd().style.width, '52px', '胶囊宽度跟随选中项');
+  ok(cnEl.classList.contains('on'), '选中项带 on');
+  ok(!T.realmBtn('global').el.classList.contains('on'), '非选中项不带 on');
+  T.setPanelRealm('global');
+  eq(T.realmInd().style.transform, 'translateX(130px)', '切到国际服胶囊跟着滑');
+
+  // 4) 切到国际服：停掉 CN 队列轮询（那些端点国际服没有）
+  T.setQueueTimer(42);
+  T.setPanelRealm('global');
+  eq(T.queueTimerValue(), null, '国际服模式下队列定时器被清掉（不再空转打 CN 端点）');
+  ok(sandbox.__timerLog.clear.includes(42), '确实调用了 clearInterval');
+
+  // 5) 后台标签页不轮询
+  T.setPanelRealm('all');
+  sandbox.document.hidden = true;
+  fetched.length = 0;
+  T.refreshVisible();
+  eq(fetched.length, 0, '标签页在后台 → 一轮轮询一个请求都不发');
+  sandbox.document.hidden = false;
+  fetched.length = 0;
+  T.refreshVisible();
+  ok(fetched.length > 0, '回到前台 → 照常轮询');
+
+  // 6) 日志页脚写真实的轮询间隔（以前写死 1.5s，实际 5s）
+  T.setLogLines(['2026-09-21 10:00:00 [task] hello']);
+  T.paintLogs();
+  ok(getEl('termMeta').textContent.includes('5s'), '日志页脚写真实间隔（5s）');
+  ok(!getEl('termMeta').textContent.includes('1.5s'), '不再是写死的 1.5s');
+  eq(T.pollMs, 5000, 'POLL_MS = 5000（轮询与页脚同源）');
+
+  // 7) 签名必须把「这一页自己的筛选」算进去。
+  //    反例是真实踩到的：go() 进账号页时会按域重设 accFilter，而数据一个字节没变——
+  //    签名若只看数据，那次重设就会被守卫跳过，表格停在旧筛选上（看着像切了没反应）。
+  T.setOverview({ accounts: [{ uid: 'cn1', realm: 'cn', credits: 1 },
+    { uid: 'gl1', realm: 'global', credits: 2 }] });
+  T.setView('accounts');
+  T.setAccFilter('all');
+  const sigAll = T.accViewSig();
+  T.setAccFilter('global');
+  ok(sigAll !== T.accViewSig(), '账号页签名随筛选变化（否则筛选变了会被跳过）');
+  T.renderAccounts();
+  ok(!getEl('accBody').innerHTML.includes('cn1'), '筛选=国际服后，国服号从表里消失');
+  T.setAccFilter('all');
+  T.setLogFilter('all'); const logSigA = T.logViewSig();
+  T.setLogFilter('task');
+  ok(logSigA !== T.logViewSig(), '日志页签名随频道筛选变化');
 
   console.log(`\n${passes} 通过 / ${fails} 失败`);
   if (fails) process.exit(1);
