@@ -1,0 +1,11 @@
+# 全仓统一 LF 行尾。
+# 理由：.sh（login.sh / signin.sh / credit.sh / upgrade-run.sh）在 Windows 上被检出成
+# CRLF 后，在 Linux / WSL / 容器里运行会报 `$'\r': command not found`；Go 源码统一 LF
+# 也让 gofmt 检查不会因为换行符报出全仓差异。
+* text=auto eol=lf
+
+# 二进制（不要做行尾转换）
+*.exe  binary
+*.png  binary
+*.jpg  binary
+*.ico  binary

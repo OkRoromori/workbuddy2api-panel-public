@@ -1,0 +1,18 @@
+# 构建产物
+wb2api
+wb2api.exe
+wb2api-*
+*.exe
+*.bak-*
+
+# 本地数据（凭证 / 状态 / 日志 / 预览）
+/data/
+/auths/
+/config.json
+dash-preview.html
+*.local.json
+
+# 编辑器
+.vscode/
+.idea/
+*.swp

@@ -1,0 +1,2265 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WorkBuddy · 控制台</title>
+<style>
+/* ── 设计令牌 ───────────────────────────────────────────────────────
+   现代数据面板风：**画布浅灰、卡片纯白**，靠底色差 + 发丝线 + 一层很轻的
+   阴影建立层次；颜色只给数据、状态与「正在说话」的控件，界面 chrome 保持无彩色。
+   （此前是「画布近白、卡片略深」的 shadcn neutral 方案——层级只靠 4/255 的
+     底色差，同屏十几张同质卡片时没有视觉重心，这是整版改掉的根本原因。）
+
+   语义分层（浅色）：
+     #f5f6f8  --bg        页面画布（浅灰，卡片浮在上面）
+     #ffffff  --surface   卡片（纯白 + --shadow-card 轻阴影 + 发丝边）
+     #eef1f5  --surface-2 次级面（输入底、行悬停的基色）
+     #e4e7ec  --line      控件描边
+     #eceff3  --line-soft 分隔线
+   数据色板（浅/深各一套，圆点/图例/图表共用）：
+     --c-blue/#2e90fa · --c-violet/#7a5af8 · --c-green/#12b76a ·
+     --c-amber/#f79009 · --c-rose/#f04438 · --c-cyan/#0ba5ec
+   --d0..--d6 是环形图的分类色板，从同一族饱和色里取，保证并排时不突兀。 */
+:root {
+  --bg: #f5f6f8; --surface: #ffffff; --surface-2: #eef1f5; --raise: #ffffff;
+  --line: #e4e7ec; --line-soft: #eceff3;
+  --ink: #101828; --ink-2: #475467; --ink-3: #667085;
+  --primary: #182230; --primary-ink: #ffffff;
+  --accent: #2e90fa; --accent-ink: #ffffff; --accent-soft: rgba(46,144,250,.10);
+  --accent-2: #92b6d5;
+  --seg-cache: #2fbf8f; --seg-in: #2e90fa; --seg-out: #92b6d5;
+  --ok: #12b76a; --ok-soft: #e7f8f1;
+  --warn: #dc6803; --warn-soft: #fef4e6;
+  --bad: #f04438; --bad-soft: #feeceb;
+  --nav-on: #eef4ff; --nav-on-ink: #1d5fc2;
+  /* KPI 图标芯片与分类强调色：soft 作底、本色作前景，成对取自同一色值。 */
+  --c-blue: #2e90fa;   --c-blue-soft: rgba(46,144,250,.12);
+  --c-violet: #7a5af8; --c-violet-soft: rgba(122,90,248,.12);
+  --c-green: #12b76a;  --c-green-soft: rgba(18,183,106,.14);
+  --c-amber: #f79009;  --c-amber-soft: rgba(247,144,9,.15);
+  --c-rose: #f04438;   --c-rose-soft: rgba(240,68,56,.12);
+  --c-cyan: #0ba5ec;   --c-cyan-soft: rgba(11,165,236,.13);
+  /* 环形图分类色板（模型占比）：前 6 名 + 「其他」。 */
+  --d0: #2e90fa; --d1: #7a5af8; --d2: #12b76a; --d3: #f79009;
+  --d4: #f04438; --d5: #0ba5ec; --d6: #98a2b3;
+  --shadow-card: 0 0 0 1px rgba(16,24,40,.045), 0 1px 2px rgba(16,24,40,.04), 0 8px 20px -10px rgba(16,24,40,.10);
+  --shadow: none; --shadow-pop: 0 12px 32px -12px rgba(16,24,40,.22);
+  --hover: color-mix(in srgb, var(--ink) 6%, transparent);
+  --mono: ui-monospace, "Cascadia Mono", "SF Mono", Consolas, monospace;
+  --sans: Inter, "Segoe UI Variable Text", "Segoe UI", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+  --display: var(--sans);
+  --radius: 12px;  /* 卡片；控件用 8px */
+}
+[data-theme="dark"] {
+  --bg: #0b0e14; --surface: #141924; --surface-2: #1a2030; --raise: #1a2030;
+  --line: #242c3d; --line-soft: #1e2534;
+  --ink: #eaecf2; --ink-2: #b6bfce; --ink-3: #7f8a9d;
+  --primary: #eef2f6; --primary-ink: #0b0e14;
+  --accent: #53a9f5; --accent-ink: #06121f; --accent-soft: rgba(83,169,245,.16);
+  --accent-2: #7d9dc4;
+  --seg-cache: #3ac79c; --seg-in: #53a9f5; --seg-out: #7d9dc4;
+  --ok: #2ed3a1; --ok-soft: rgba(46,211,161,.14);
+  --warn: #fdb022; --warn-soft: rgba(253,176,34,.14);
+  --bad: #f97066; --bad-soft: rgba(249,112,102,.14);
+  --nav-on: #1b2740; --nav-on-ink: #8abaff;
+  --c-blue: #53a9f5;   --c-blue-soft: rgba(83,169,245,.16);
+  --c-violet: #9b8afb; --c-violet-soft: rgba(155,138,251,.16);
+  --c-green: #2ed3a1;  --c-green-soft: rgba(46,211,161,.15);
+  --c-amber: #fdb022;  --c-amber-soft: rgba(253,176,34,.15);
+  --c-rose: #f97066;   --c-rose-soft: rgba(249,112,102,.15);
+  --c-cyan: #36bffa;   --c-cyan-soft: rgba(54,191,250,.15);
+  --d0: #53a9f5; --d1: #9b8afb; --d2: #2ed3a1; --d3: #fdb022;
+  --d4: #f97066; --d5: #36bffa; --d6: #667085;
+  --shadow-card: 0 0 0 1px rgba(255,255,255,.035), 0 10px 28px -12px rgba(0,0,0,.55);
+  --shadow: none; --shadow-pop: 0 12px 32px -12px rgba(0,0,0,.65);
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body { height: 100%; overflow: hidden; }
+body {
+  background: var(--bg); color: var(--ink); font: 14px/1.55 var(--sans);
+  -webkit-font-smoothing: antialiased;
+}
+::selection { background: var(--accent-soft); }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 4px; }
+@media (prefers-reduced-motion: reduce) { * { transition: none !important; animation: none !important; } }
+
+/* ── 壳层：左侧导航 + 主区 ─────────────────────────────────────────
+   参考设计里侧栏与画布**同色**（--sidebar 就是 --background）、且没有分隔线，
+   靠留白和排版区分。这里保留一条极弱的分隔线（--line-soft）：本地面板的信息密度
+   比参考设计高，一条 #ebebeb 的线能让"点哪里会不会跳出内容"更明确，成本几乎为零。 */
+.shell { display: grid; grid-template-columns: 288px 1fr; height: 100%; min-height: 100%; overflow: hidden; }
+.nav {
+  background: var(--bg); border-right: 1px solid var(--line-soft);
+  display: flex; flex-direction: column; height: 100%; overflow: hidden;
+}
+.nav ul {
+  list-style: none; padding: 8px 12px; flex: 1; min-height: 0;
+  overflow-y: auto; scrollbar-width: none; -ms-overflow-style: none;
+}
+.nav ul::-webkit-scrollbar { width: 0; height: 0; }
+.brand {
+  display: flex; align-items: center; gap: 10px;
+  padding: 22px 18px 18px;
+}
+.brand .mark {
+  width: 22px; height: 22px; border-radius: 6px; background: transparent;
+  color: var(--ink); display: grid; place-items: center; flex: none;
+  border: 1px solid var(--line);
+}
+.brand .mark svg { width: 14px; height: 14px; }
+.brand .name { font-weight: 650; letter-spacing: -.02em; font-size: 16px; }
+.brand .sub { color: var(--ink-3); font-size: 11px; font-family: var(--mono); margin-top: 2px; }
+
+/* 导航项尺寸照抄参考设计：高 32px、字号 12px、圆角 8px、内边距 10px。
+   注意字号是 **12px** 而不是常见的 13-14px——侧栏比内容区"小一号"，
+   视线自然落到内容上，这是参考设计显安静的主要原因之一。 */
+.nav a {
+  display: flex; align-items: center; gap: 8px; padding: 0 10px; height: 32px; margin-bottom: 4px;
+  color: var(--ink-3); text-decoration: none; border-radius: 8px; font-size: 12px; font-weight: 400;
+}
+.nav a:hover { background: var(--surface-2); color: var(--ink); }
+.nav a.on { background: var(--nav-on); color: var(--nav-on-ink); font-weight: 500; }
+.nav a.on:hover { background: var(--nav-on); color: var(--nav-on-ink); }
+.nav a svg { width: 16px; height: 16px; flex: none; opacity: .9; }
+/* 选中项的图标加一层极淡的填充（参考设计用 fillOpacity .14）——
+   比只加粗字重更容易在扫视时定位，也不会让文字变糊。 */
+.nav a.on svg { opacity: 1; fill: currentColor; fill-opacity: .14; }
+.nav .sig { padding: 14px 16px 18px; border-top: none; font-size: 11.5px; color: var(--ink-3); }
+/* 并发指示：数字用等宽+大字，比周围状态字重一档——它是这块唯一会动的东西。 */
+.sig-k { color: var(--ink-3); }
+.sig-v { font: 650 14px var(--mono); color: var(--ink); font-variant-numeric: tabular-nums; margin-left: 5px; }
+.sig-v.hot { color: var(--ok); }
+.sig-now { color: var(--ink-3); margin-left: 6px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 130px; }
+/* 正在服务的账号行：整行描边 + 左侧绿条，一眼看到是谁在跑 */
+.acc tbody tr.busy .mark i { background: var(--ok); box-shadow: 0 0 0 2px var(--ok-soft); }
+.acc tbody tr.busy { background: color-mix(in srgb, var(--ok) 6%, transparent); }
+.nav .sig .row { display: flex; align-items: center; gap: 7px; }
+.pulse { width: 7px; height: 7px; border-radius: 50%; background: var(--ok); flex: none; }
+.pulse.bad { background: var(--bad); }
+.pulse.warn { background: var(--warn); }
+
+.main { min-width: 0; min-height: 0; height: 100%; overflow: auto; display: flex; flex-direction: column; background: var(--bg); }
+/* 顶栏底边必须和内容区左右对齐，否则那条线会比卡片宽出左右各一个内边距（实测差 96px），
+   看起来就是"横线没对齐"。所以：外层只管吸顶与背景，内层负责 1180 的居中与 40px 内边距，
+   分隔线画在**再内一层**——它不含内边距，宽度正好等于卡片列宽。 */
+.topbar {
+  padding: 24px 0 0;
+  background: color-mix(in srgb, var(--bg) 88%, transparent);
+  backdrop-filter: blur(12px) saturate(1.2);
+  -webkit-backdrop-filter: blur(12px) saturate(1.2);
+  position: sticky; top: 0; z-index: 20;
+}
+@supports not (backdrop-filter: blur(1px)) { .topbar { background: var(--bg); } }
+.topbar-in { max-width: 1280px; width: 100%; margin: 0 auto; padding: 0 32px; }
+.topbar-row {
+  display: flex; align-items: center; gap: 12px;
+  padding-bottom: 14px; border-bottom: 1px solid var(--line-soft);
+}
+/* 日志视图是全宽表格，顶栏跟着放宽，保持左右一致。 */
+body.logs-view .topbar-in { max-width: none; }
+.topbar h2 { font-size: 22px; font-weight: 600; letter-spacing: -.02em; line-height: 1.2; }
+.topbar .sep { color: var(--ink-3); display: none; }
+.topbar .meta { color: var(--ink-3); font-size: 12.5px; }
+.topbar .grow { flex: 1; }
+/* hidden 属性必须能压过显式 display。
+   浏览器给 [hidden] 的规则是 `display:none`，但**优先级最低**——任何显式 display
+   （.stats{display:grid}、.view{...}）都会把它盖掉，于是「hidden」的盒子照样显示。
+   之前只有 .view 被单独补过一条，其他地方（如 #dashQuality）就漏成了
+   「按钮点了没反应」。这里统一用 !important 兜住所有同类问题。 */
+[hidden] { display: none !important; }
+.view { padding: 24px 32px 72px; max-width: 1280px; width: 100%; margin: 0 auto; }
+#view-logs:not([hidden]) {
+  display: flex; flex-direction: column; flex: 1; min-height: 0;
+  padding-bottom: 20px; max-width: none;
+}
+#view-logs .box { flex: 1; display: flex; flex-direction: column; min-height: 0; margin-bottom: 0; }
+#view-logs .term { flex: 1; display: flex; flex-direction: column; min-height: 0; }
+
+/* ── 控件 ─────────────────────────────────────────────────────────── */
+button {
+  font: inherit; color: var(--ink-2); background: transparent;
+  border: 1px solid var(--line); border-radius: 6px; padding: 6px 12px; cursor: pointer;
+  transition: background .12s, border-color .12s, color .12s;
+}
+button:hover:not(:disabled) { background: var(--surface-2); color: var(--ink); }
+button:disabled { opacity: .5; cursor: default; }
+/* 主按钮：全站唯一一处渐变——蓝→靛的 135° 渐变让它从一排灰按钮里"浮出来"，
+   这是彩色点缀原则的落点：chrome 无彩色，唯一的彩色给「当前最重要的动作」。 */
+button.primary { background: linear-gradient(135deg, var(--c-blue), var(--c-violet)); border: none; color: #fff; font-weight: 500; box-shadow: 0 2px 8px -2px rgba(46,144,250,.5); }
+button.primary:hover:not(:disabled) { filter: brightness(1.08); box-shadow: 0 3px 12px -2px rgba(46,144,250,.55); }
+[data-theme="dark"] button.primary:hover:not(:disabled) { filter: brightness(1.12); }
+button.ghost { background: var(--surface); border-color: var(--line); color: var(--ink-2); }
+button.ghost:hover:not(:disabled) { color: var(--ink); background: var(--surface-2); border-color: var(--ink-3); }
+/* 顶栏主题按钮是纯图标，给它一个可见的圆形边界，别让它只像一个小图标。 */
+button.icon { display: inline-grid; place-items: center; }
+/* 高危操作（移除/清理）要和普通操作在**形状**上就不一样，不能只靠文字颜色区分——
+   颜色对色觉障碍不可靠，而且扫视时几乎看不出差别。所以给红边框 + 淡红底。 */
+button.danger { color: var(--bad); border-color: color-mix(in srgb, var(--bad) 40%, var(--line)); background: var(--bad-soft); }
+button.danger:hover:not(:disabled) { color: #fff; background: var(--bad); border-color: var(--bad); }
+button.xs { padding: 5px 11px; font-size: 12.5px; border-radius: 8px; }
+button.icon { padding: 7px 9px; }
+.more { position: relative; display: inline-block; }
+.more > summary {
+  list-style: none; cursor: pointer;
+  font: inherit; color: var(--ink); background: var(--surface);
+  border: 1px solid var(--line); border-radius: 8px; padding: 5px 11px; font-size: 12.5px;
+}
+.more > summary::-webkit-details-marker { display: none; }
+.more-menu {
+  position: absolute; right: 0; top: calc(100% + 6px); z-index: 30;
+  min-width: 148px; padding: 6px; display: flex; flex-direction: column; gap: 4px;
+  transform-origin: top right;
+}
+.more-menu button { width: 100%; text-align: left; }
+input, select {
+  font: inherit; color: var(--ink); background: var(--raise);
+  border: 1px solid var(--line); border-radius: 8px; padding: 8px 12px; width: 100%;
+}
+input:focus, select:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+[data-theme="dark"] input:focus, [data-theme="dark"] select:focus { border-color: var(--ink); }
+input[type=checkbox] { width: auto; accent-color: var(--ink); }
+label.fld { display: block; margin-bottom: 14px; }
+label.fld > .lb { display: block; font-size: 12.5px; color: var(--ink-2); margin-bottom: 5px; }
+label.fld > .hint { display: block; font-size: 11.5px; color: var(--ink-3); margin-top: 4px; }
+.inline { display: flex; align-items: center; gap: 9px; }
+
+/* ── 统计条（观测区）──────────────────────────────────────────────── */
+/* KPI 是各自独立的卡片，间隔 **8px**（参考设计 grid gap-2，截图实测也是 8px）。
+   以前是一条大容器靠竖线切分；改成独立卡片后，「卡片」在全站只有一种形态。 */
+.stats {
+  display: grid; grid-template-columns: repeat(6, 1fr);
+  gap: 8px; margin-bottom: 16px;
+  background: transparent; border-radius: 0; box-shadow: none; overflow: visible;
+}
+@media (max-width: 980px) { .stats { grid-template-columns: repeat(3, 1fr); } }
+@media (max-width: 560px) { .stats { grid-template-columns: repeat(2, 1fr); } }
+/* 卡片**没有边框**：底色差（#f7f7f5 on #fdfdfd）本身就把它和画布分开了。
+   加描边反而会破坏参考设计那种"轻"——像素扫描证实参考卡片边缘是直接过渡。
+   column-reverse 是这里的关键：手写的 .stat 是「先数字后标签」的老结构，
+   反向列让标签跑到数字上方，不必改十几处 HTML。
+   子元素顺序（DOM）：sub → v → k，视觉自上而下即 k → v → sub。 */
+.stat {
+  display: flex; flex-direction: column-reverse; justify-content: flex-end;
+  padding: 16px; min-height: 112px;
+  background: var(--surface); border: none; border-radius: var(--radius);
+  box-shadow: var(--shadow-card);
+}
+.stat .v { font: 500 24px/1.15 var(--sans); font-variant-numeric: tabular-nums; letter-spacing: -.02em; white-space: nowrap; }
+.stat .k {
+  color: var(--ink-3); font-size: 12px; letter-spacing: 0; margin-bottom: 12px;
+  display: flex; align-items: center; justify-content: space-between; gap: 8px; min-height: 16px;
+}
+.stat .k > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* ⓘ 提示放在标签右侧（参考设计把图标放这一侧），把"悬停才出现"的 title 变成看得见的入口。 */
+.stat .k .info { opacity: .55; flex: none; cursor: help; }
+.stat .k .info:hover { opacity: 1; }
+.stat .sub { color: var(--ink-3); font-size: 11px; margin-top: 6px; font-variant-numeric: tabular-nums;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.stat.good .v { color: var(--ok); } .stat.warn .v { color: var(--warn); } .stat.bad .v { color: var(--bad); }
+
+/* ── 英雄 KPI（仪表盘首行）────────────────────────────────────────
+   首行是全页的视觉锚点：彩色图标芯片 + 标签 + 大数字。芯片用 soft 底 +
+   本色前景的同色对，四张卡各占一色，解决"十几个同质米白卡没有重心"的问题。
+   布局是**横向**的（图标在左、数字在右）：比竖排矮近一半，
+   首屏塞得下更多内容——高度在这里比气势值钱。 */
+/* justify-content 必须显式改回 flex-start：基础 .stat 留下的 flex-end 在横向
+   布局里会把整组内容推到卡片右半边，两侧各剩一大块死白（用户截图指出的留白）。
+   hero-body 撑满剩余宽度后，文字块左对齐、贴着图标，右缘留白才显得「正常」。 */
+.stat.hero { flex-direction: row; align-items: center; justify-content: flex-start;
+  gap: 12px; padding: 14px 18px; min-height: 84px; }
+.stat.hero .ico {
+  width: 38px; height: 38px; border-radius: 10px; display: grid; place-items: center;
+  flex: none;
+}
+.stat.hero .ico svg { width: 19px; height: 19px; }
+.stat.hero .hero-body { display: flex; flex-direction: column; min-width: 0; flex: 1 1 auto; }
+.stat.hero .k { margin-bottom: 2px; justify-content: flex-start; }
+.stat.hero .v { font-size: 27px; font-weight: 650; letter-spacing: -.02em; }
+.stat.hero .sub { margin-top: 2px; }
+.ico.t-blue   { background: var(--c-blue-soft);   color: var(--c-blue); }
+.ico.t-violet { background: var(--c-violet-soft); color: var(--c-violet); }
+.ico.t-green  { background: var(--c-green-soft);  color: var(--c-green); }
+.ico.t-amber  { background: var(--c-amber-soft);  color: var(--c-amber); }
+.ico.t-rose   { background: var(--c-rose-soft);   color: var(--c-rose); }
+.ico.t-cyan   { background: var(--c-cyan-soft);   color: var(--c-cyan); }
+
+/* ── 面板块 ───────────────────────────────────────────────────────── */
+/* 同 KPI 卡：无边框、底色分层、内边距 16px（宽屏 20px）。 */
+.box {
+  background: var(--surface); border: none; border-radius: var(--radius);
+  box-shadow: var(--shadow-card); margin-bottom: 16px; overflow: hidden;
+}
+.box > header { display: flex; align-items: center; gap: 10px; padding: 16px 16px 0; border-bottom: none; flex-wrap: wrap; }
+@media (min-width: 900px) { .box > header { padding: 20px 20px 0; } }
+/* 面板标题字号/字重照参考设计（text-sm font-medium = 14px/500）。
+   以前是 13px/600——偏小偏重，扫一眼会觉得"到处都是重点"。 */
+.box > header h3 { font-size: 14px; font-weight: 500; letter-spacing: 0; color: var(--ink); }
+.box > header .grow { flex: 1; }
+.box > header .note { color: var(--ink-3); font-size: 12px; }
+.box .pad { padding: 18px; }
+
+/* ── 账号表（签名元素：健康色条 + 积分量条）───────────────────────── */
+.tbl-wrap { overflow-x: auto; }
+.acc { width: 100%; border-collapse: collapse; font-size: 13px; min-width: 640px; }
+.acc th {
+  text-align: left; font-weight: 500; font-size: 11.5px; color: var(--ink-3);
+  padding: 10px 16px; border-bottom: 1px solid var(--line-soft); white-space: nowrap;
+  background: transparent; letter-spacing: .02em;
+}
+.acc td { padding: 12px 16px; border-bottom: 1px solid var(--line-soft); vertical-align: middle; }
+.acc tr:last-child td { border-bottom: none; }
+.acc tbody tr:hover { background: var(--hover); }
+/* 健康色条用真实单元格（td.mark）实现，而不是 tr::before 伪元素：
+   伪元素在表格行内会被浏览器当作匿名单元格插入行首，整行内容右移一列、
+   与表头错位——窗口越宽列越宽越明显。 */
+.acc .mark { width: 3px; min-width: 3px; padding: 0; }
+.acc .mark i { display: block; width: 3px; height: 100%; min-height: 36px; background: var(--ok); }
+.acc tbody tr.cool .mark i { background: var(--warn); }
+.acc tbody tr.off .mark i { background: var(--bad); }
+/* 模型表无色条（健康指示只属于账号表）。 */
+.acc.md .mark { display: none; }
+/* 操作列用 width:1px + nowrap 的经典技巧：列宽恰为内容宽，其余列按内容自适应 */
+.acc .c-acts { width: 1px; white-space: nowrap; }
+/* 档位标签列：允许换行在标签之间（不拆字），并给足最小宽度 */
+.acc .efs { min-width: 150px; }
+.acc .efs .tag { margin: 1px 0; }
+/* 模型表：紧凑一些，7 列在常见窗口下尽量免横向滚动 */
+.acc.md { min-width: 700px; }
+.acc.md th, .acc.md td { padding: 10px 9px; }
+.who { min-width: 118px; max-width: 200px; }
+#taskTable .who { max-width: 360px; }
+#taskTable .who .nm, #taskTable .who .id { white-space: normal; word-break: break-all; }
+.who .nm { font-weight: 550; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.who .id { font-family: var(--mono); font-size: 11.5px; color: var(--ink-3); margin-top: 1px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* 账号状态列的国服/国际服徽标：国服=蓝（默认），国际服=紫（.global），颜色区分一眼分域。
+   vertical-align:1px 是让 10px 的小字和 13px 的昵称基线对齐。 */
+.realm-tag { display: inline-block; margin-left: 6px; padding: 1px 5px; border-radius: 4px; font: 500 10px/1 var(--sans); color: var(--accent); background: var(--accent-soft); border: 1px solid color-mix(in srgb, var(--accent) 22%, transparent); vertical-align: 1px; }
+.realm-tag.global { color: var(--c-violet); background: var(--c-violet-soft); border-color: color-mix(in srgb, var(--c-violet) 22%, transparent); }
+/* 添加账号弹窗的选域行 */
+.realm-row { display: flex; align-items: center; gap: 14px; padding: 4px 0 10px; }
+.realm-opt { display: inline-flex; align-items: center; gap: 5px; font-size: 12.5px; color: var(--ink-2); cursor: pointer; }
+.realm-opt input { accent-color: var(--accent); margin: 0; }
+/* 模型页「重复模型」视图：一行一个重名模型 = 模型名 + 当前生效域徽标 + 两域倍率 + 域下拉。
+   倍率并排显示是为了让「钉哪一域」有依据（同名模型两域倍率可能不同，如 hy4-preview
+   国服 x0.29 / 国际服 x0.00）。 */
+.dup-note { font-size: 12.5px; color: var(--ink-3); padding: 2px 0 8px; }
+.dup-note select { margin-left: 6px; max-width: 150px; }
+.dup-row td.who .nm { font-family: var(--mono); }
+.dup-row td .rates { color: var(--ink-3); font-size: 12px; }
+.dup-row td .dd select { max-width: 150px; }
+/* 可点击改名的显示名：默认无痕，悬停给出「这里能点」的提示 */
+.who .nm.edit { cursor: pointer; border-bottom: 1px dashed transparent; transition: border-color .12s, color .12s; }
+.who .nm.edit:hover { border-bottom-color: var(--ink-3); color: var(--accent); }
+.num { font-family: var(--mono); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.cred { min-width: 84px; }
+.cred .n { font-family: var(--mono); font-variant-numeric: tabular-nums; font-size: 13px; }
+/* 进度条槽宽必须跟列宽走，不能写死：
+   之前 .bar 写死 max-width:88px，而列宽（.cred/.hp）由表格自动伸缩——
+   列变宽时条缩在左边、列变窄时条溢出，看起来就是"积分后面那条线没对齐"。
+   现在让条占满所在单元格（td 设 display:block 上下文），槽永远左右贴齐列边。 */
+.bar { height: 3px; background: var(--line); border-radius: 2px; margin-top: 5px; overflow: hidden; width: 100%; }
+.bar i { display: block; height: 100%; background: var(--accent); border-radius: 2px; }
+.tprog { min-width: 92px; }
+.tprog .n { font-family: var(--mono); font-variant-numeric: tabular-nums; font-size: 12.5px; }
+.tprog .bar { height: 4px; }
+.tprog .bar i.ok { background: var(--ok); }
+.tprog .bar i.warn { background: var(--warn); }
+.tag {
+  display: inline-flex; align-items: center; gap: 5px; padding: 2px 10px;
+  border-radius: 999px; font-size: 12px; font-weight: 600; white-space: nowrap;
+}
+.tag.ok { background: var(--ok-soft); color: var(--ok); }
+.tag.warn { background: var(--warn-soft); color: var(--warn); }
+.tag.bad { background: var(--bad-soft); color: var(--bad); }
+.tag.mute { background: var(--surface-2); color: var(--ink-3); border: 1px solid var(--line); }
+
+/* 健康度列：分数 badge + 同色细条。三档配色复用 .tag 的语义色，一眼分辨。 */
+.hp { min-width: 76px; cursor: help; }
+.hp .bar i.ok { background: var(--ok); }
+.hp .bar i.warn { background: var(--warn); }
+.hp .bar i.bad { background: var(--bad); }
+/* 操作列：td 必须保持 table-cell 身份，否则 border-collapse 下它不再参与行框，
+   这一格的 border-bottom 就不画了 —— 表现就是"每行底部的横线到最右边断了"。
+   所以 flex 只加在里面的 .btn-row 上，不要加在 td 自己身上。 */
+.acts { white-space: nowrap; }
+.acts .btn-row { display: flex; gap: 5px; justify-content: flex-end; }
+.acts button { padding: 3.5px 8px; font-size: 12.5px; white-space: nowrap; flex: none; }
+
+.empty { padding: 40px 20px; text-align: center; color: var(--ink-3); }
+.empty .big { font-size: 14px; color: var(--ink-2); margin-bottom: 6px; }
+
+/* ── 日志（macOS 终端质感）────────────────────────────────────────────── */
+/* 整体面板用浅/深主题色，但日志区固定深底——参考截图里那个终端样式。
+   不随主题变：一来深底更"像终端"，二来避免主题切换时日志区闪一下。
+   圆点 + 居中标题 + 等宽字 + 状态标记 badge。 */
+.term { background: #0d0f14; border-radius: 0 0 12px 12px; overflow: hidden; }
+.term-bar {
+  display: flex; align-items: center; gap: 8px;
+  padding: 10px 14px; background: #1a1d24;
+  border-bottom: 1px solid #2a2e38; position: relative;
+}
+.term-dot { width: 11px; height: 11px; border-radius: 50%; display: inline-block; }
+.term-dot.rd { background: #ff5f57; }
+.term-dot.yr { background: #febc2e; }
+.term-dot.gn { background: #28c840; }
+.term-title {
+  position: absolute; left: 50%; transform: translateX(-50%);
+  font: 12px var(--mono); color: #9ca3af; pointer-events: none;
+}
+.term-meta { margin-left: auto; font: 11px var(--mono); color: #6b7280; }
+.term-body {
+  /* 默认撑满窗口剩余高度（对齐截图里几乎铺满的终端）。
+     用户仍可拖底边调整；有手动高度时走 inline style，否则走 flex 填满。 */
+  flex: 1; height: auto; min-height: 280px; max-height: none;
+  overflow: auto; resize: vertical;
+  padding: 12px 16px; font: 12.5px/1.7 var(--mono);
+  white-space: pre-wrap; word-break: break-all;
+  color: #d4d4d4; margin: 0;
+}
+.term-body .ln { display: block; }
+.term-body .ln-ts { color: #6b7280; margin-right: 8px; }
+.term-body .ln-tag {
+  display: inline-block; padding: 1px 7px; margin-right: 8px; border-radius: 4px;
+  font-size: 11px; font-weight: 600; letter-spacing: .02em;
+  vertical-align: 1px;
+}
+.term-body .ln-tag.ok   { background: rgba(40,200,64,.18);   color: #6ee787; }
+.term-body .ln-tag.fail { background: rgba(255,95,87,.18);   color: #ff8a82; }
+.term-body .ln-tag.skip { background: rgba(156,163,175,.18); color: #cbd5e1; }
+.term-body .ln-tag.wait { background: rgba(254,188,46,.18);  color: #fcd34d; }
+.term-body .ln-tag.run  { background: rgba(61,95,224,.28);   color: #93c5fd; }
+/* 分类标签（自动归类）：每行都有，min-width 让两字标签竖排对齐 */
+.term-body .ln-cat {
+  display: inline-block; padding: 1px 7px; margin-right: 8px; border-radius: 4px;
+  font-size: 11px; font-weight: 600; letter-spacing: .02em; vertical-align: 1px;
+  min-width: 36px; text-align: center;
+}
+.term-body .ln-cat.c-sys    { background: rgba(139,152,181,.16); color: #8b98b5; }
+.term-body .ln-cat.c-panel  { background: rgba(192,132,252,.16); color: #c084fc; }
+.term-body .ln-cat.c-task   { background: rgba(34,211,238,.15);  color: #22d3ee; }
+.term-body .ln-cat.c-checkin{ background: rgba(74,222,128,.15);  color: #4ade80; }
+.term-body .ln-cat.c-travel { background: rgba(244,114,182,.15); color: #f472b6; }
+.term-body .ln-cat.c-act    { background: rgba(251,146,60,.15);  color: #fb923c; }
+.term-body .ln-cat.c-keep   { background: rgba(252,211,77,.15);  color: #fcd34d; }
+.term-body .ln-cat.c-streak { background: rgba(163,230,53,.15);  color: #a3e635; }
+.term-body .ln-cat.c-night  { background: rgba(129,140,248,.18); color: #818cf8; }
+.term-body .ln-cat.c-bal    { background: rgba(96,165,250,.16);  color: #60a5fa; }
+.term-body .ln-cat.c-chat   { background: rgba(45,212,191,.15);  color: #2dd4bf; }
+/* uid 已替换为显示名；title 保留完整 uid 供 hover 查看 */
+.term-body .ln-uid { color: #c084fc; cursor: help; }
+.term-body .ln.e { color: #ff8a82; }
+.term-body .ln.w { color: #fcd34d; }
+/* 一键完成进度条：贴在终端标题栏与日志正文之间，不占日志滚动区 */
+.task-prog { padding: 8px 16px; background: #15181f; border-bottom: 1px solid #2a2e38; }
+.task-prog .tp-bar { height: 4px; background: #2a2e38; border-radius: 2px; overflow: hidden; }
+.task-prog .tp-bar i {
+  display: block; height: 100%; width: 0;
+  background: #4ade80; border-radius: 2px; transition: width .3s ease;
+}
+.task-prog .tp-text { font: 11px var(--mono); color: #9ca3af; margin-top: 6px; }
+.task-prog.done .tp-bar i { background: #6b7280; }
+
+/* ── 配置表单 ─────────────────────────────────────────────────────── */
+.grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 0 20px; }
+.grid3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 0 16px; }
+@media (max-width: 860px) { .grid2, .grid3 { grid-template-columns: 1fr; } }
+fieldset { border: none; margin-bottom: 6px; }
+legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom: 10px; }
+.hr { height: 1px; background: var(--line-soft); margin: 4px 0 16px; }
+.switch { display: flex; align-items: center; justify-content: space-between; padding: 9px 0; }
+.switch .lb { font-size: 13.5px; }
+.savebar {
+  display: flex; align-items: center; gap: 12px; padding: 13px 17px;
+  border-top: 1px solid var(--line-soft); background: var(--surface-2);
+  position: sticky; bottom: 0;
+}
+.savebar .grow { flex: 1; }
+.restart-note { color: var(--warn); font-size: 12.5px; }
+
+/* ── 弹层 ─────────────────────────────────────────────────────────── */
+.veil { position: fixed; inset: 0; background: rgba(6,8,13,.62); backdrop-filter: blur(2px); display: none; z-index: 60; }
+.veil.on { display: flex; align-items: center; justify-content: center; padding: 20px; }
+/* 浮层（弹窗/下拉）用纯白 --raise：它们要"浮在卡片之上"，
+   和卡片同色会糊在一起分不出层次。这里也确实是全站唯一用阴影的地方。 */
+.dlg {
+  border-radius: var(--radius);
+  width: 560px; max-width: 100%; max-height: 86vh; display: flex; flex-direction: column;
+}
+.dlg header { padding: 17px 20px 13px; border-bottom: 1px solid var(--line-soft); }
+.dlg header h3 { font-size: 15px; font-weight: 620; }
+.dlg header .hint { color: var(--ink-3); font-size: 12.5px; margin-top: 5px; }
+.dlg .body { padding: 18px 20px; overflow: auto; }
+.dlg footer { padding: 13px 20px; border-top: 1px solid var(--line-soft); display: flex; gap: 10px; }
+.dlg footer .grow { flex: 1; }
+.url {
+  background: var(--surface-2); border: none; border-radius: 6px;
+  padding: 11px 13px; font: 12px var(--mono); word-break: break-all; color: var(--ink);
+  margin: 8px 0 12px; user-select: all;
+}
+.state { font-size: 13px; color: var(--ink-2); display: flex; align-items: center; gap: 8px; }
+.state.ok { color: var(--ok); } .state.err { color: var(--bad); }
+/* 确认弹窗正文：保留换行（文案里用 \n 分行讲清后果），行高放松便于扫读。 */
+.cfm-text { font-size: 13.5px; line-height: 1.7; color: var(--ink-2); white-space: pre-wrap; }
+button.primary.danger { background: var(--bad); border-color: var(--bad); color: #fff; }
+button.primary.danger:hover:not(:disabled) { filter: brightness(1.06); }
+.dots::after { content: "…"; animation: blink 1.2s steps(4) infinite; }
+@keyframes blink { 0% { opacity: 1; } 50% { opacity: .3; } 100% { opacity: 1; } }
+
+/* ── Toast ───────────────────────────────────────────────────────── */
+#toasts { position: fixed; right: 20px; bottom: 20px; z-index: 90; display: flex; flex-direction: column; gap: 8px; align-items: flex-end; }
+.tst {
+  background: var(--raise); border: 1px solid var(--line); border-left: 3px solid var(--ink-3);
+  border-radius: 8px; padding: 10px 15px; font-size: 13px; box-shadow: var(--shadow-pop); max-width: 380px;
+}
+.tst.ok { border-left-color: var(--ok); } .tst.err { border-left-color: var(--bad); }
+
+/* ── 仪表盘 ───────────────────────────────────────────────────────── */
+/* 列数可变的 .stats：默认 6 列，仪表盘要用 5 / 4 列时按需覆盖。 */
+.stats.c5 { grid-template-columns: repeat(5, 1fr); }
+.stats.c4 { grid-template-columns: repeat(4, 1fr); }
+.stats.c2 { grid-template-columns: repeat(2, 1fr); }
+@media (max-width: 980px) { .stats.c5, .stats.c4 { grid-template-columns: repeat(3, 1fr); } }
+@media (max-width: 560px) { .stats.c5, .stats.c4, .stats.c2 { grid-template-columns: repeat(2, 1fr); } }
+/* 数值放不下时缩小字号而不是撑破卡片（差值可达 12 位）。 */
+.stat .v.sm { font-size: 23px; letter-spacing: -.02em; }
+.stat .v.xs { font-size: 17px; letter-spacing: 0; }
+
+/* ── 时序图（近 24 小时）────────────────────────────────────────────
+   手写 SVG 而不是引图表库：面板 CSP 是 script-src 'self'，外链脚本一律被拦，
+   为一个 24 点的图自造打包流程不划算。样式照参考设计（recharts）的取值：
+   只有横向虚线网格、轴不画轴线与刻度线、柱半透明、第二条序列走虚线。
+
+   ⚠️ 这里的类名一律带 **ch- 前缀（ch-bar / ch-grid / …）**，不是洁癖：
+   CSS 类名是全局的，SVG 元素同样会被普通 CSS 规则命中，而且**规则优先级高于
+   SVG 的 width/height 属性**。之前柱子就叫 class="bar"，撞上了第 300 行那条
+   早就存在的进度条规则 `.bar { height:3px; width:100% }`——于是 24 根柱子全被
+   压成"满宽 3px 高的横线"，还溢出到右轴外面。症状是"线全跑废了"，
+   而原因在几百行外一条毫不相干的 CSS 里。
+   （前缀用 ch- 而不是 c-：日志分类已经占了 c-sys/c-task/c-acts 那一族名字，
+     TestChartClassesDoNotCollide 按前缀认图表类名，前缀必须真的独一份。） */
+.chart { padding: 12px 10px 0; }
+.chart svg { display: block; width: 100%; height: auto; overflow: visible; }
+/* 悬停提示的定位基准：光标竖线 + 浮层都相对这一层绝对定位。 */
+.chart-wrap { position: relative; }
+.chart-cursor { position: absolute; width: 1px; background: var(--line); pointer-events: none; }
+/* 浮层用 --raise（纯白）+ 阴影：它要浮在卡片之上，和卡片同色会糊在一起。
+   默认浮在光标上方居中；贴近顶部时加 .below 翻到下方，否则会被卡片裁掉。 */
+.chart-tip {
+  position: absolute; z-index: 14; pointer-events: none;
+  min-width: 150px; padding: 9px 11px;
+  transform: translate(-50%, calc(-100% - 12px));
+}
+.chart-tip.below { transform: translate(-50%, 12px); }
+.chart-tip .tt-h { color: var(--ink-3); font-size: 11.5px; margin-bottom: 6px; }
+.chart-tip .tt-r { display: flex; align-items: center; gap: 6px; font-size: 12px; padding: 1.5px 0; }
+.chart-tip .tt-r b { margin-left: auto; padding-left: 14px; font-weight: 500; font-variant-numeric: tabular-nums; }
+/* 网格只画横线且是虚线：竖线会和柱子糊在一起，实线又比数据本身还抢眼。 */
+.chart .ch-grid { stroke: var(--line); stroke-width: 1; stroke-dasharray: 3 3; }
+/* 轴只留数字，不画轴线/刻度线（参考设计 tickLine / axisLine 全关）。 */
+.chart .ch-axis { fill: var(--ink-3); font: 11px var(--sans); font-variant-numeric: tabular-nums; }
+.chart .ch-bar { fill: var(--accent); fill-opacity: .42; }
+.chart .ch-bar-zero { fill: var(--line); fill-opacity: .6; }
+.chart .ch-line { fill: none; stroke: var(--accent-2); stroke-width: 1.25; stroke-dasharray: 5 4;
+  stroke-linejoin: round; stroke-linecap: round; }
+.chart .ch-dot { fill: var(--bg); stroke: var(--accent-2); stroke-width: 1.5; }
+.chart-x {
+  display: flex; justify-content: center; align-items: center; gap: 16px;
+  padding: 10px 14px 12px; color: var(--ink-3); font-size: 12px;
+}
+.chart-x .ch-lg { display: inline-flex; align-items: center; gap: 6px; }
+.chart-x .ch-sw { width: 9px; height: 9px; border-radius: 2px; background: var(--accent); opacity: .42; flex: none; }
+.chart-x .ch-sw-ln { background: var(--accent-2); opacity: 1; border-radius: 999px; height: 2px; width: 13px; }
+.chart-x .ch-sw-ln2 { background: var(--c-violet); opacity: 1; border-radius: 999px; height: 2px; width: 13px; }
+
+/* ── 仪表盘可视化扩展（7 天趋势 / 模型环形 / 余额走势 / 账号分布）──────
+   新图表沿用 ch- 前缀约定：CSS 类名是全局的，SVG 同样会被普通规则命中，
+   前缀 + .chart 作用域是「新图不撞旧样式」的两道锁（见上方 hourChart 的事故注）。 */
+/* 第二序列（请求数折线）：紫色和用量蓝同屏也能分清谁是谁。 */
+.chart .ch-line2 { fill: none; stroke: var(--c-violet); stroke-width: 1.5; stroke-dasharray: 5 4;
+  stroke-linejoin: round; stroke-linecap: round; }
+.chart .ch-dot2 { fill: var(--surface); stroke: var(--c-violet); stroke-width: 1.5; }
+.chart .ch-area { stroke: none; }
+/* 趋势卡的时间范围切换（7 天 / 24 小时）：芯片家族的小号成员。 */
+.range-toggle { display: inline-flex; gap: 2px; margin-left: 10px; }
+.range-toggle .chip { padding: 2px 10px; font-size: 11.5px; }
+/* 余额走势的实线与端点（ch-line 是虚线，语义是「次级序列」，余额主线要用实线）。 */
+.chart .ch-bal { fill: none; stroke: var(--accent); stroke-width: 1.6; stroke-linejoin: round; stroke-linecap: round; }
+.chart .ch-bal-dot { fill: var(--surface); stroke: var(--accent); stroke-width: 1.6; }
+/* 积分流水图：双线对称——消耗蓝线、获取绿线，同粗同点，只有颜色之分。
+   （渐变面积 + 裸线混排被用户指为违和；两序列同单位同轴，就该同构。） */
+.chart .ch-earn { fill: none; stroke: var(--c-green); stroke-width: 1.7; stroke-linejoin: round; stroke-linecap: round; }
+.chart .ch-spent { fill: none; stroke: var(--c-blue); stroke-width: 1.7; stroke-linejoin: round; stroke-linecap: round; }
+.chart .ch-dot3 { fill: var(--surface); stroke: var(--c-green); stroke-width: 1.5; }
+.chart .ch-dot3-blue { fill: var(--surface); stroke: var(--c-blue); stroke-width: 1.5; }
+.chart-x .ch-sw-earn { background: var(--c-green); opacity: 1; border-radius: 999px; height: 2px; width: 13px; }
+.chart-x .ch-sw-line-blue { background: var(--c-blue); opacity: 1; border-radius: 999px; height: 2px; width: 13px; }
+.chart-tip .tt-r .ch-sw-line-blue { background: var(--c-blue); opacity: 1; border-radius: 999px; height: 2px; width: 13px; }
+/* 悬停提示里的图例色块。此前 .ch-sw 只在 .chart-x 下有样式，
+   提示卡里的色块一直是不可见的——顺手在这里补齐同一套。 */
+.chart-tip .tt-r .ch-sw { width: 9px; height: 9px; border-radius: 2px; background: var(--accent); opacity: .55; flex: none; display: inline-block; }
+.chart-tip .tt-r .ch-sw-ln { background: var(--accent-2); opacity: 1; border-radius: 999px; height: 2px; width: 13px; }
+/* 浮层里的「获取」色块必须是绿：.ch-sw-earn 只有 .chart-x 下的规则时，
+   浮层里会回落成消耗蓝——消耗/获取两行同色，读不出谁是谁。 */
+.chart-tip .tt-r .ch-sw-earn { background: var(--c-green); opacity: 1; border-radius: 999px; height: 2px; width: 13px; }
+.chart-tip .tt-r .ch-sw-ln2 { background: var(--c-violet); opacity: 1; border-radius: 999px; height: 2px; width: 13px; }
+/* 环形图：段的颜色走 SVG stroke 属性（内联着色，不吃全局 CSS）。
+   中心文字必须自带 fill：环形 SVG 不在 .chart 容器里，若只写在
+   .chart 作用域下会拿不到样式，SVG 文字回落黑色——浅色看不出问题，
+   深色主题下就是黑压黑。 */
+.ch-donut-c { fill: var(--ink); }
+.ch-donut-s { fill: var(--ink-3); font-size: 11px; }
+.donut-wrap { display: flex; align-items: center; gap: 18px; }
+.donut-legend { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 7px; }
+.donut-legend .it { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--ink-2); min-width: 0; }
+.donut-legend .it .nm { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.donut-legend .it b { margin-left: auto; padding-left: 8px; font-weight: 500; font-variant-numeric: tabular-nums; color: var(--ink); white-space: nowrap; }
+.donut-legend .it .pct { color: var(--ink-3); font-size: 11.5px; width: 46px; text-align: right; flex: none; }
+.donut-legend .sw { width: 8px; height: 8px; border-radius: 3px; flex: none; }
+
+/* 账号积分分布：横向条形列表（HTML 实现，无需 SVG）。 */
+.dist { display: flex; flex-direction: column; gap: 9px; overflow-y: auto; }
+.dist .row { display: grid; grid-template-columns: minmax(84px, 128px) 1fr auto; align-items: center; gap: 10px; font-size: 12.5px; }
+.dist .row .nm { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ink-2); }
+.dist .row .nm.off { color: var(--ink-3); }
+.dist .row .dbar { height: 8px; border-radius: 999px; background: var(--surface-2); overflow: hidden; }
+.dist .row .dbar i { display: block; height: 100%; border-radius: 999px;
+  background: linear-gradient(90deg, var(--c-blue), var(--c-violet)); opacity: .85; }
+.dist .row.off .dbar i { background: var(--d6); opacity: .45; }
+.dist .row .n { font-family: var(--mono); font-variant-numeric: tabular-nums; color: var(--ink); white-space: nowrap; }
+.dist .row .n.mute { color: var(--ink-3); }
+
+/* ── 指标带（单价与性能）────────────────────────────────────────────
+   次级指标不各占一张卡：一行 flex 均分、发丝线分隔、无卡片 chrome。
+   信息密度向「一行读完全部次级指标」收敛，卡片数从 13 张降到 4 张。 */
+.stripbox > header { padding-bottom: 12px; }
+.mstrip { display: flex; flex-wrap: wrap; padding: 2px 6px 10px; }
+.mstrip .mi {
+  flex: 1 1 auto; min-width: 128px; display: flex; flex-direction: column; gap: 3px;
+  padding: 7px 18px;
+}
+.mstrip .mi + .mi { border-left: 1px solid var(--line-soft); }
+.mstrip .k { font-size: 11.5px; color: var(--ink-3); white-space: nowrap; }
+.mstrip .v { font: 500 16.5px/1.25 var(--sans); font-variant-numeric: tabular-nums; letter-spacing: -.01em; white-space: nowrap; }
+.mstrip .v.warn { color: var(--warn); }
+.mstrip.hairline { border-top: 1px solid var(--line-soft); padding-top: 4px; padding-bottom: 12px; }
+@media (max-width: 760px) {
+  .mstrip .mi { flex: 1 1 40%; border-left: none !important; }
+  .mstrip.hairline { border-top: none; }
+}
+
+/* ── 交互手感（流畅度与反馈）────────────────────────────────────────
+   三件小事都是「可感知但不吵」的量级：
+   1. 视图切换 160ms 淡入上移——切页有连续感，不再「啪」一下硬切；
+   2. 按钮/芯片按压时下沉 1px——点了有回响；
+   3. 英雄卡悬停上浮——它是全页锚点，给一点「可以摸」的暗示。
+   prefers-reduced-motion 的全局开关会把这些动画一并关掉。 */
+.view:not([hidden]) { animation: viewIn .16s cubic-bezier(.16,1,.3,1); }
+@keyframes viewIn {
+  from { opacity: 0; transform: translateY(6px); }
+  to   { opacity: 1; transform: none; }
+}
+button:active:not(:disabled), .chip:active:not(:disabled), .tgl:active { transform: translateY(1px); }
+.stat.hero { transition: transform .16s ease, box-shadow .16s ease; }
+.stat.hero:hover { transform: translateY(-2px); box-shadow: 0 0 0 1px rgba(16,24,40,.05), 0 12px 28px -10px rgba(16,24,40,.16); }
+[data-theme="dark"] .stat.hero:hover { box-shadow: 0 0 0 1px rgba(255,255,255,.05), 0 12px 28px -10px rgba(0,0,0,.6); }
+.tst { animation: tstIn .2s cubic-bezier(.16,1,.3,1); }
+@keyframes tstIn {
+  from { opacity: 0; transform: translateX(14px); }
+  to   { opacity: 1; transform: none; }
+}
+
+/* 占比细条：模型/账号在总数里的份额。 */
+.share { display: flex; align-items: center; gap: 7px; min-width: 96px; }
+.share .bar { flex: 1; }
+.share span { color: var(--ink-3); font-size: 11.5px; font-variant-numeric: tabular-nums; }
+/* 单元格内的迷你占比条：不占新列，跟在数字下面一行。 */
+.mini-bar { height: 3px; background: var(--line); border-radius: 2px; margin-top: 5px; overflow: hidden; }
+.mini-bar i { display: block; height: 100%; background: var(--accent); border-radius: 2px; opacity: .75; }
+
+/* ── 可视化区（仪表盘首屏的视觉焦点）───────────────────────────────── */
+.viz-grid { display: grid; grid-template-columns: 1.85fr 1fr; gap: 16px; margin-bottom: 20px; }
+@media (max-width: 900px) { .viz-grid { grid-template-columns: 1fr; } }
+/* 可视卡和账号卡同一种形态：无边框、底色分层、圆角 12px + 轻阴影。 */
+.viz-card {
+  background: var(--surface); border: none; border-radius: var(--radius); padding: 16px;
+  box-shadow: var(--shadow-card); display: flex; flex-direction: column;
+}
+@media (min-width: 900px) { .viz-card { padding: 20px; } }
+/* 卡片小标题照参考设计：12px、句子大小写（不再全大写 + 字距），数字 20px/500。
+   以前是 11.5px 全大写配 22px/650 的粗数字——同屏里最重的一行竟然是它。 */
+.viz-h { display: flex; align-items: baseline; gap: 9px; font-size: 12px; color: var(--ink-3); letter-spacing: 0; }
+.viz-h b {
+  font: 500 20px/1.2 var(--sans); color: var(--ink); letter-spacing: -.02em;
+  font-variant-numeric: tabular-nums;
+}
+.viz-h .grow { flex: 1; }
+.viz-h .sub { font-size: 11.5px; color: var(--ink-3); }
+
+/* 堆叠构成条：三段宽度就是各自占比。
+   12px 高的胶囊而不是 34px 的厚块——构成是"一眼看比例"的信息，
+   占那么大面积只会显得沉；分段之间留 2px 空隙，比贴在一起更清楚。 */
+.stack {
+  display: flex; gap: 2px; height: 12px; border-radius: 999px; overflow: hidden;
+  margin: 14px 0 12px; background: var(--surface-2);
+}
+.stack i { display: block; height: 100%; transition: width .4s cubic-bezier(.4,0,.2,1); }
+/* 纯色，不用渐变：渐变在 12px 高的条上只会让相邻两段看起来"半明半暗"，
+   反而不好分辨边界。 */
+.stack i.s-cache { background: var(--seg-cache); }
+.stack i.s-in { background: var(--seg-in); }
+.stack i.s-out { background: var(--seg-out); }
+.legend { display: flex; flex-wrap: wrap; gap: 6px 18px; font-size: 12px; color: var(--ink-2); }
+.legend .it { display: flex; align-items: center; gap: 7px; }
+.legend .sw { width: 8px; height: 8px; border-radius: 50%; flex: none; }
+.legend .sw.s-cache { background: var(--seg-cache); }
+.legend .sw.s-in { background: var(--seg-in); }
+.legend .sw.s-out { background: var(--seg-out); }
+.legend b { font-variant-numeric: tabular-nums; color: var(--ink); font-weight: 500; font-size: 12.5px; }
+.legend .pct { color: var(--ink-3); font-size: 11.5px; }
+/* 积分概览卡样式见下方 .mtx / .burn / .loop */
+/* 积分概览卡：总积分 → 已耗/剩余 → 按当前速率还能用多久。
+   三个数字一行（mtx），下面一条"生命周期"条（已耗 + 未来预测），再下面是 24h 柱。 */
+.mtx { display: grid; grid-template-columns: repeat(2, 1fr); gap: 14px 18px; margin: 16px 0 14px; }
+.mtx .it { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.mtx .lb { font-size: 11px; color: var(--ink-3); letter-spacing: .02em; }
+.mtx .v { font: 650 21px/1 var(--sans); font-variant-numeric: tabular-nums; letter-spacing: -.03em; white-space: nowrap; }
+.mtx .v.sm { font-size: 16px; letter-spacing: -.01em; }
+/* 单位必须明显小于数值：「−228 积分/天」里真正要读的是 228，
+   单位跟数值同字号会抢读数的视觉权重，扫一眼分不清主次。 */
+.mtx .v .unit { font-size: 11.5px; font-weight: 500; letter-spacing: 0; color: var(--ink-3); }
+.mtx .v.warn { color: var(--warn); }
+.mtx .v.bad { color: var(--bad); }
+.mtx .v.good { color: var(--ok); }
+.mtx .note { font-size: 11px; color: var(--ink-3); }
+/* 额度条：本周期「已耗 / 剩余」两段。
+   两段用**不同纹理**（实心 / 斜纹）而不只是不同颜色——灰度打印、色觉障碍、
+   深色模式下两色接近，这几种情况都还能分辨。只靠颜色区分是不够的。 */
+.burn { display: flex; height: 12px; border-radius: 999px; overflow: hidden; background: var(--surface-2); }
+.burn i { display: block; height: 100%; transition: width .45s cubic-bezier(.4,0,.2,1); }
+.burn i.used { background: var(--accent); }
+.burn i.free {
+  background-color: color-mix(in srgb, var(--accent) 12%, transparent);
+  background-image: repeating-linear-gradient(45deg,
+    color-mix(in srgb, var(--accent) 42%, transparent) 0 4px, transparent 4px 8px);
+}
+.bar-x { display: flex; justify-content: space-between; font-size: 11.5px; color: var(--ink-3); margin-top: 7px; }
+.bar-x b { font-family: var(--mono); color: var(--ink); font-variant-numeric: tabular-nums; font-weight: 600; }
+.bar-x .pct { opacity: .8; }
+/* 样本不足一天的标注：琥珀色，提醒这个日速率是方向性参考而非稳态值 */
+.warn-note { color: var(--warn); }
+/* 无限循环建议：把「再加几个号才能收支平衡」直接算成一个数字。
+   签到进账按账号数线性增长，所以消耗速率固定时，账号数就是唯一的调节旋钮。 */
+.loop { margin-top: 14px; padding: 12px 14px; border-radius: 9px; background: var(--surface-2); }
+.loop.ok { background: var(--ok-soft); }
+.loop-h { display: flex; align-items: baseline; gap: 8px; font-size: 11.5px; color: var(--ink-3); }
+/* 标签 + 问号作为一组、组内居中：
+   直接让 .q 挂在 align-items:baseline 的行里时，它的基线取自「?」这个字形，
+   圆圈会相对标签文字飘高飘低。包一层 inline-flex + center 就稳定贴着文字中线。 */
+.loop-lb { display: inline-flex; align-items: center; gap: 5px; }
+.loop-h b { font: 650 18px var(--sans); color: var(--ink); font-variant-numeric: tabular-nums; letter-spacing: -.03em; }
+.loop.ok .loop-h b { color: var(--ok); }
+.loop-note { font-size: 11.5px; color: var(--ink-3); margin-top: 6px; line-height: 1.65; }
+
+/* 圈问号提示：悬停出气泡。
+   为什么不用原生 title：它有约 1 秒延迟、样式完全不可控、深色模式下常看不清，
+   而且长文案会挤成一行。自建气泡即时、可换行、跟随主题。 */
+/* ── 浮层容器统一基类 ────────────────────────────────────────────────
+   所有"浮在内容之上"的容器共用一个基类，取值照「请求审计」那个筛选菜单：
+   白底 --raise + 1px 发丝边 + 圆角 10 + 浮层阴影 + 入场动画。
+
+   为什么用**基类继承**而不是逐个复制：浮层有七八处（筛选菜单、子菜单、更多、
+   提示、各种弹窗），复制粘贴的话"改一次要改八处"，只要漏一处就会长出两种长相
+   ——这正是之前提示样式变成三套的原因。以后要调，改这里一处即可。 */
+.pop {
+  background: var(--raise);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  box-shadow: var(--shadow-pop);
+  animation: popIn .17s cubic-bezier(.16,1,.3,1);
+}
+@keyframes popIn {
+  from { opacity: 0; transform: translateY(-5px) scale(.97); }
+  to   { opacity: 1; transform: none; }
+}
+/* 大弹窗（对话框）不跟着从上方滑入——它是屏幕中央的模态，用轻微的缩放即可。 */
+.pop.center { animation-name: popCenter; }
+@keyframes popCenter {
+  from { opacity: 0; transform: scale(.97); }
+  to   { opacity: 1; transform: none; }
+}
+
+/* ── 原生控件统一外观 ────────────────────────────────────────────────
+   问题不是"原生控件不好看"，而是**它们的弹层是浏览器画的**：<select> 展开的
+   那个列表、<checkbox> 的勾、数字框的上下箭头，都是 OS/浏览器的 UI，CSS 完全
+   碰不到。所以不管外面怎么美化，点开那一瞬间还是系统长相。
+
+   做法：**保留原生元素当数据源，另外用 DOM 套一层自定义外观**。
+   - select  → 隐藏原生，画一个按钮 + .pop 菜单；选中后写回原生 value 并派发 change
+   - checkbox→ 隐藏原生，画一个开关；点开关时 writeback 原生的 checked
+   - number  → 去掉原生步进器（spinner）
+
+   为什么坚持保留原生元素：`collectConfig()` 用 `f.elements[name]`、
+   `loadConfig()` 读写 `el.checked` / `el.value`、`$('accSort').value`——
+   这些代码全都按原生控件写的。留着原生元素，它们一行都不用动。 */
+input[type=number]::-webkit-outer-spin-button,
+input[type=number]::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+input[type=number] { -moz-appearance: textfield; appearance: textfield; }
+
+/* 原生控件本体隐藏，但**不能 display:none、更不能从 DOM 里删掉**：
+   删了就取不到值（`f.elements[name]` 全部失效）、也拿不到焦点。
+
+   为什么这几条要 !important：它是**工具类**，必须压过组件样式。
+   `input, select { width:100% }`（0,0,1）、`input[type=checkbox]{width:auto}`（0,1,1）、
+   `select.mini{width:auto}`（0,1,1）三条都会盖掉这里的 width —— 那样元素虽
+   opacity:0 看不见，却仍按 100% 宽度参与绝对定位，可能撑出横向滚动条。
+   工具类的语义就是"无论如何都生效"，这里用 !important 是诚实的表达。 */
+.native-hidden {
+  position: absolute !important;
+  width: 1px !important; height: 1px !important;
+  opacity: 0 !important;
+  pointer-events: none !important;
+  margin: 0 !important; padding: 0 !important; border: 0 !important;
+  overflow: hidden !important;
+}
+
+/* ── 自定义下拉 ────────────────────────────────────────────────────── */
+.dd { position: relative; display: inline-block; }
+.dd-btn {
+  display: inline-flex; align-items: center; gap: 8px; justify-content: space-between;
+  min-width: 96px; padding: 6px 10px; font-size: 12.5px;
+  background: var(--surface-2); color: var(--ink);
+  border: 1px solid var(--line); border-radius: 8px; cursor: pointer;
+}
+.dd-btn:hover { background: var(--hover); }
+.dd-btn .dd-t { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dd-btn .dd-c { flex: none; opacity: .55; transition: transform .16s ease; }
+.dd.open .dd-btn .dd-c { transform: rotate(180deg); }
+.dd-menu {
+  position: absolute; left: 0; top: calc(100% + 6px); z-index: 42;
+  min-width: 100%; max-height: 300px; overflow-y: auto; padding: 5px;
+  transform-origin: top left;
+}
+.dd-menu.right { left: auto; right: 0; transform-origin: top right; }
+.dd-o {
+  display: flex; align-items: center; gap: 8px; width: 100%;
+  padding: 7px 9px; border: 0; border-radius: 7px; cursor: pointer;
+  background: transparent; color: var(--ink); font: inherit; font-size: 12.5px;
+  text-align: left; white-space: nowrap;
+}
+.dd-o:hover { background: var(--hover); }
+.dd-o .dd-ck { flex: none; width: 14px; color: var(--accent); opacity: 0; }
+.dd-o.on .dd-ck { opacity: 1; }
+.dd-o.on { font-weight: 600; }
+
+/* 设置页里的下拉占满整行，和旁边的输入框对齐。
+   为什么不用 `.pad .dd`：`prompt_mode` 那个 select 在 `.grid2 > label.fld` 里，
+   不经过 .pad。按**容器语义**选（"在带标签的字段里就撑满"）比按父子结构选更稳，
+   以后把表单调进别的容器也不会掉宽度。 */
+.fld .dd, .fld .dd-btn,
+.pad  .dd, .pad  .dd-btn { width: 100%; }
+
+/* ── 自定义开关（替 checkbox）───────────────────────────────────────
+   类名必须叫 tgl 而**不能叫 sw**：`.sw` 已经被「token 构成」图的图例色块
+   （8×8 小圆点）占用了。两条 `.sw` 权重相同、后定义的赢，开关这条会把图例
+   色块撑成 38×22 的灰胶囊——和之前 `class="bar"` 撞上全局进度条是同一种 bug。
+   教训：新增类名之前先全仓搜一遍有没有重名。 */
+.tgl {
+  position: relative; flex: none; width: 38px; height: 22px; border-radius: 999px;
+  background: var(--line); cursor: pointer; transition: background .18s ease;
+}
+.tgl::after {
+  content: ''; position: absolute; top: 2px; left: 2px; width: 18px; height: 18px;
+  border-radius: 50%; background: #fff; box-shadow: 0 1px 3px rgba(0,0,0,.25);
+  transition: transform .18s cubic-bezier(.16,1,.3,1);
+}
+.tgl.on { background: var(--ink); }
+.tgl.on::after { transform: translateX(16px); }
+.tgl:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+[data-theme="dark"] .tgl::after { background: #e8e8e8; }
+
+/* ── 统一提示浮层 ────────────────────────────────────────────────────
+   全站唯一的提示样式，同样继承 .pop（和筛选菜单、图表悬停卡同一套长相）。
+   位置由 JS 算（跟光标走、夹在视口内），所以这里不写定位方向。 */
+.tip {
+  position: fixed; left: 0; top: 0; z-index: 60;
+  max-width: 300px; padding: 9px 11px;
+  color: var(--ink); font: 400 11.5px/1.65 var(--sans); text-align: left;
+  white-space: pre-line; /* 保留提示文案里的换行（分段的解释） */
+  pointer-events: none; opacity: 0;
+  transition: opacity .12s ease;
+  /* 不设宽度：让长文案自然折行，短文案不被撑宽 */
+  width: max-content;
+}
+.tip.on { opacity: 1; }
+[data-tip], [title] { cursor: help; }
+
+/* ── 账号数建议的问号（.q）─────────────────────────────────────────
+   只保留图标本身；提示内容走统一浮层（data-tip）——以前它自带一个黑色 ::after
+   气泡，和图表那张白卡片是两种长相，同一个东西不该有两种外观。 */
+.q {
+  display: inline-grid; place-items: center; flex: none;
+  width: 14px; height: 14px; border-radius: 50%;
+  border: 1px solid var(--line); color: var(--ink-3);
+  font: 700 9.5px/1 var(--sans); cursor: help; position: relative;
+}
+.q:hover { border-color: var(--ink-3); color: var(--ink); }
+.viz-empty { padding: 40px 0; text-align: center; color: var(--ink-3); font-size: 13px; }
+.mut { color: var(--ink-3); font-size: 11.5px; }
+.acc.w { min-width: 960px; }
+.acc.sm-t { min-width: 720px; }
+.acc.ck { min-width: 860px; }
+.sched-on { font-weight: 650; }
+.dash-empty { padding: 30px 17px; text-align: center; color: var(--ink-3); font-size: 13px; }
+
+/* ── 工具条 / 筛选芯片 / 搜索 ─────────────────────────────────────── */
+.toolbar {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  padding: 8px 22px 14px; border-bottom: none; background: transparent;
+}
+.toolbar .grow { flex: 1; min-width: 8px; }
+.search {
+  width: 240px; max-width: 100%; padding: 7px 12px; font-size: 13px;
+  background: var(--raise); border-color: var(--line);
+}
+.search:focus { border-color: var(--accent); }
+.chips { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+.chip {
+  font: inherit; color: var(--ink-3); background: transparent;
+  border: 1px solid transparent; border-radius: 999px;
+  padding: 3px 10px; font-size: 12px; cursor: pointer; line-height: 1.4;
+}
+.chip:hover:not(:disabled) { background: var(--hover); color: var(--ink); }
+.chip.on { background: var(--nav-on); color: var(--nav-on-ink); border-color: transparent; font-weight: 600; }
+.chip .n { font-family: var(--mono); font-size: 11px; color: var(--ink-3); margin-left: 4px; }
+.chip.on .n { color: inherit; opacity: .7; }
+select.mini {
+  width: auto; padding: 6px 10px; font-size: 12.5px; background: var(--surface-2);
+}
+.pulse-strip {
+  display: flex; flex-wrap: wrap; gap: 10px 22px; align-items: baseline;
+  padding: 13px 0; margin-bottom: 16px;
+  background: transparent; border: none; border-radius: 0;
+  font-size: 13.5px; color: var(--ink-2); box-shadow: none;
+}
+.pulse-strip b { color: var(--ink); font: 600 14px/1.2 var(--mono); font-variant-numeric: tabular-nums; }
+.pulse-strip .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--ok); display: inline-block; margin-right: 6px; vertical-align: 1px; }
+.pulse-strip.warn .dot { background: var(--warn); }
+.pulse-strip.bad .dot { background: var(--bad); }
+.kbd {
+  font: 11px var(--mono); color: var(--ink-3); border: 1px solid var(--line);
+  border-radius: 4px; padding: 0 5px; margin-left: 8px;
+}
+.access-row {
+  display: flex; align-items: center; gap: 8px; margin: 8px 0 14px;
+}
+.access-row .url { flex: 1; margin: 0; }
+.access-bar {
+  display: flex; align-items: center; gap: 22px; flex-wrap: wrap;
+  margin: 4px 0 28px; padding: 0; color: var(--ink-2); font-size: 13px;
+}
+.access-item { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.access-item .lb { color: var(--ink-3); font-size: 11.5px; flex: none; }
+.access-item .url {
+  margin: 0; padding: 0; background: none; border: none; color: var(--ink);
+  font: 12.5px var(--mono); user-select: all;
+}
+.copy-ok { color: var(--ok); font-size: 12.5px; }
+
+/* 到期提醒（顶栏右端）：**只显示最快到期的一条**，点击开详情弹窗。
+   为什么不留完整清单：4 个日期会把顶栏撑高一大截，而顶栏是全局常驻区。
+   为什么底色用 --raise(#ffffff) 而不是 --surface：这张卡浮在**画布**上（不是卡片上），
+   而画布是近白 #fdfdfd、--surface 是略深的 #f7f7f5——用 --surface 会比底色还暗，
+   看着像凹进去的一块。顶栏要的是「浮起来」，所以取比画布更亮的纯白。
+   档位按最近一批剩余天数：>10 天绿、≤10 天黄、≤3 天红；颜色之外还有文字标记。 */
+.expiry-chip {
+  margin-left: auto;
+  display: inline-flex; align-items: center; gap: 8px;
+  padding: 7px 12px; border-radius: 9px;
+  background: var(--raise);
+  border: 1px solid var(--line);
+  box-shadow: var(--shadow-pop);
+  font: inherit; text-align: left; cursor: pointer;
+  white-space: nowrap;
+}
+.expiry-chip:hover { border-color: var(--ink-3); }
+.expiry-chip:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.expiry-chip .ex-h { font: 600 12.5px var(--sans); color: var(--ink); }
+.expiry-chip .ex-n { font-size: 11.5px; color: var(--ink-3); }
+.expiry-chip .ex-more { font-size: 11px; color: var(--ink-3); }
+.expiry-chip .ex-more::after { content: " ›"; color: var(--ink-3); }
+
+/* 充裕：还有 10 天以上，绿。不抢注意力，但一眼知道"不急"。 */
+.expiry-chip.ok {
+  background: var(--ok-soft);
+  border-color: color-mix(in srgb, var(--ok) 38%, var(--line));
+}
+.expiry-chip.ok .ex-h { color: var(--ok); }
+
+/* 该留意：10 天以内，黄。 */
+.expiry-chip.warn {
+  background: var(--warn-soft);
+  border-color: color-mix(in srgb, var(--warn) 42%, var(--line));
+}
+.expiry-chip.warn .ex-h { color: var(--warn); }
+
+/* 死线：3 天以内，红。 */
+.expiry-chip.bad {
+  background: var(--bad-soft);
+  border-color: color-mix(in srgb, var(--bad) 45%, var(--line));
+}
+.expiry-chip.bad .ex-h { color: var(--bad); }
+
+/* ── 密钥页 ───────────────────────────────────────────────────────── */
+.acc.keys { min-width: 780px; }
+/* 密钥列用等宽字：掩码看的是"哪一把"，等宽比比例字体好认。 */
+.acc.keys .kk { font-family: var(--mono); font-size: 12.5px; white-space: nowrap; cursor: help; }
+.acc.keys .kk .pre { color: var(--ink-3); }
+/* 默认密钥那行淡一点：它不是"管理对象"，只是告诉你"这个在设置里改"。 */
+.acc.keys tbody tr.own { background: color-mix(in srgb, var(--accent) 4%, transparent); }
+.acc.keys tbody tr.own:hover { background: color-mix(in srgb, var(--accent) 8%, transparent); }
+.acc.keys .kname { font-weight: 550; }
+.acc.keys .kname .sub { font-size: 11.5px; color: var(--ink-3); font-weight: 400; margin-top: 2px; }
+.acc.keys .use { font-variant-numeric: tabular-nums; }
+.acc.keys .use .sub { font-size: 11.5px; color: var(--ink-3); margin-top: 2px; }
+.acc.keys .use.none { color: var(--ink-3); }
+.key-model-list { margin-top: 9px; max-height: 190px; overflow: auto; border: 1px solid var(--line); padding: 8px; }
+.key-model-list label { display: flex; align-items: center; gap: 8px; padding: 5px 6px; font-size: 12.5px; }
+.key-model-list label:hover { background: var(--soft); }
+.key-model-list .rate { margin-left: auto; color: var(--ink-3); font-family: var(--mono); }
+.key-model-list label .rname { display: inline-flex; align-items: center; }
+/* 密钥弹窗的模型工具栏：搜索 + 域筛选（模型多了以后靠它定位；筛选只是视图，勾选不丢） */
+.key-model-tools { display: flex; gap: 8px; align-items: center; margin-top: 9px; }
+/* 域开关切到「国际服」时，国内服专属页（任务管理/任务中心）只留一条说明卡片，其余内容整体
+   收起——比让用户面对一堆报错或空数字清楚。JS 只切 .realm-global 类。
+   说明卡片**不能用 hidden 属性控制**：面板有 `[hidden]{display:none!important}`（见上方注释），
+   挂上 hidden 后任何 display 规则都压不过（实测踩到过），所以这里用类规则正反控制。 */
+.view > .box.cn-only-note { display: none; }
+.view.realm-global > .box.cn-only-note { display: block; }
+.view.realm-global > .box:not(.cn-only-note), .view.realm-global > .stats { display: none; }
+.key-model-tools .search { flex: 1; min-width: 0; }
+.key-model-tools .chips { margin: 0; flex-wrap: nowrap; }
+
+/* ── 请求审计页：三层表面 ─────────────────────────────────────────────
+   参考设计的层次（像素实测）：KPI 行 #f7f7f5 卡片 → token 条 #f9f8f8 半强度
+   → 表格与工具行落在 #fdfdfd 画布上、完全不加卡片。
+   一开始我把三层塞进同一张 #f7f7f5 面板、用发丝线分格——那是把层次压平了，
+   背景从深到浅的过渡才是这套设计"轻"的来源。 */
+.pagebar {
+  display: flex; align-items: center; gap: 8px; justify-content: flex-end;
+  flex-wrap: wrap; margin-bottom: 12px;
+}
+.pagebar .note { margin-right: auto; color: var(--ink-3); font-size: 12px; }
+
+.tokstrip { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-bottom: 16px; }
+@media (max-width: 760px) { .tokstrip { grid-template-columns: repeat(2, 1fr); } }
+/* 半强度底色：介于卡片(#f7f7f5)与画布(#fdfdfd)之间，所以它"看得见但不抢"。
+   用 color-mix 从两个已有令牌算出来，深色主题下自动跟着走。 */
+.tokstrip .cell {
+  display: flex; align-items: center; gap: 7px; padding: 12px 16px; min-width: 0;
+  background: color-mix(in srgb, var(--surface) 55%, var(--bg));
+  border-radius: var(--radius);
+}
+.tokstrip svg { color: var(--ink-3); flex: none; }
+.tokstrip .lb { color: var(--ink-3); font-size: 12px; flex: none; }
+.tokstrip b { margin-left: auto; font-weight: 500; font-size: 13px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+
+/* 表格直接在画布上（不加卡片），只靠发丝线分行——参考设计就是这样。 */
+#view-usage .tbl-wrap { margin: 0 -4px; }
+
+/* ── 筛选菜单（级联）─────────────────────────────────────────────────
+   一行搜索 + 一个「筛选」按钮，取代原来两行 chip + 一个下拉。
+   为什么做成级联：可筛选的维度有五个（模型/状态/模式/密钥/账号），
+   平铺出来就是一大片，而平时大多数维度都停在"全部"。 */
+.flt-wrap { position: relative; flex: none; }
+.flt-btn {
+  display: inline-flex; align-items: center; gap: 7px; white-space: nowrap;
+  padding: 8px 12px; font-size: 13px; background: var(--raise);
+  border: 1px solid var(--line); border-radius: 8px;
+}
+.flt-btn[aria-expanded="true"] { border-color: var(--ink-3); background: var(--surface-2); }
+/* 有筛选生效时按钮自己说出来，否则"筛选了但忘了"是最常见的困惑。 */
+.flt-btn.active { border-color: var(--ink); color: var(--ink); font-weight: 500; }
+.flt-n {
+  min-width: 17px; height: 17px; padding: 0 5px; border-radius: 999px;
+  background: var(--primary); color: var(--primary-ink);
+  font-size: 11px; line-height: 17px; text-align: center; font-weight: 600;
+}
+.flt-menu {
+  position: absolute; right: 0; top: calc(100% + 6px); z-index: 40;
+  min-width: 172px; padding: 6px;
+  transform-origin: top right;
+}
+.flt-cat {
+  position: relative; display: flex; align-items: center; gap: 8px;
+  padding: 8px 10px; border-radius: 7px; cursor: pointer; font-size: 13px;
+  transition: background-color .12s ease;
+}
+.flt-cat > span { flex: 1; }
+.flt-cat .cur { color: var(--ink-3); font-size: 11.5px; max-width: 84px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.flt-cat .chev { color: var(--ink-3); flex: none; transition: transform .16s cubic-bezier(.16,1,.3,1); }
+.flt-cat:hover, .flt-cat[aria-expanded="true"] { background: var(--hover); }
+.flt-cat[aria-expanded="true"] .chev { transform: translateX(2px); }
+.flt-cat.set > span { font-weight: 500; }
+/* 子菜单从左侧滑入：方向上有"展开"的连续感，比淡入更能说明它从哪来。 */
+/* 子菜单默认向**右**展开（顺着阅读方向，也是级联菜单的惯例）。
+   只有右侧真的放不下时才翻到左边——判据在 renderFilterMenu 里，用按钮**右边缘**
+   到窗口右边的距离算：菜单本身也有宽度，只看左边缘会误判。 */
+.flt-sub {
+  position: absolute; left: calc(100% + 6px); top: -6px; z-index: 41;
+  min-width: 186px; max-height: 320px; overflow-y: auto; padding: 6px;
+  transform-origin: left center;
+  animation: fltSubIn .15s cubic-bezier(.16,1,.3,1);
+}
+/* 从父级那一侧"长出来"：起点稍微偏向面板，再滑到位。
+   这比单纯淡入更能说明它是从哪个分类展开的。 */
+@keyframes fltSubIn { from { opacity: 0; transform: translateX(-6px) scale(.98); } to { opacity: 1; transform: none; } }
+/* 右侧放不下时翻到左边，动画方向跟着镜像。 */
+.flt-menu.flip .flt-sub {
+  left: auto; right: calc(100% + 6px); transform-origin: right center;
+  animation-name: fltSubInR;
+}
+@keyframes fltSubInR { from { opacity: 0; transform: translateX(6px) scale(.98); } to { opacity: 1; transform: none; } }
+.flt-sub .hd { color: var(--ink-3); font-size: 11px; padding: 4px 10px 6px; }
+.flt-opt {
+  display: flex; align-items: center; gap: 8px; width: 100%;
+  padding: 7px 10px; border: none; border-radius: 7px; background: transparent;
+  font: inherit; font-size: 13px; color: var(--ink); text-align: left; cursor: pointer;
+  transition: background-color .12s ease;
+}
+.flt-opt > span { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.flt-opt .cnt { color: var(--ink-3); font-size: 11.5px; font-variant-numeric: tabular-nums; }
+.flt-opt:hover { background: var(--hover); }
+.flt-opt.on { font-weight: 500; }
+.flt-opt .tick { color: var(--ink); flex: none; opacity: 0; transition: opacity .12s ease; }
+.flt-opt.on .tick { opacity: 1; }
+.flt-sep { height: 1px; background: var(--line-soft); margin: 5px 8px; }
+
+/* 搜索框：图标叠在左侧，输入框留出左边的空位。 */
+.search-wrap { position: relative; display: flex; align-items: center; }
+.search-wrap svg { position: absolute; left: 11px; color: var(--ink-3); pointer-events: none; }
+.search-wrap .search { padding-left: 32px; }
+
+/* ── 使用日志（请求审计流水）─────────────────────────────────────────
+   一行回答四件事：谁用的、用了什么、花了多少、快不快。
+   信息密度参照「一行里塞两行小字」的做法——用量与性能各自成组放在一个格子内，
+   而不是摊成七八个独立列（那样每列都窄得读不出数，还必然横向滚动）。   */
+.acc.ulog { min-width: 1060px; }
+.acc.ulog th, .acc.ulog td { padding: 11px 12px; }
+/* 失败行整行淡红：筛"今天有没有出错"时不必逐行读状态码。 */
+/* 失败 / 缺用量行：**细条 + 极淡底色**，而不是整行重色。
+   整行铺色的毛病是"一屏里有几行就把表格染成一块"，而这两类行恰恰可能成片出现
+   （客户端提前断开时，连续几条都会缺 usage）。信号改由左侧 2px 条承担——
+   它在视觉上占的面积极小，但边界锐利，扫视时反而更抓得住。 */
+.acc.ulog tbody tr.row-bad { background: color-mix(in srgb, var(--bad) 4%, transparent); }
+.acc.ulog tbody tr.row-bad > td:first-child { box-shadow: inset 2px 0 0 var(--bad); }
+.acc.ulog tbody tr.row-miss { background: color-mix(in srgb, var(--warn) 4%, transparent); }
+.acc.ulog tbody tr.row-miss > td:first-child { box-shadow: inset 2px 0 0 var(--warn); }
+.acc.ulog tbody tr.row-bad:hover, .acc.ulog tbody tr.row-miss:hover { background: var(--hover); }
+/* 用量格：2 列「标签 + 数值」的小网格（输入/输出/缓存/积分）。 */
+/* 用量格：2×2 的「标签 + 数值」小块，每块自带底色。
+   为什么要底色：四个数并排时没有边界，扫一眼分不清哪个数属于哪个标签
+   —— 尤其数字右对齐之后，"输入 470,767" 和下一行很容易串读。
+   底色用当前文字色兑一点透明度算，浅色下变深、深色下变亮，两种主题都成立。 */
+.ugrid { display: grid; grid-template-columns: 1fr 1fr; gap: 4px; font-size: 12px; }
+.ugrid .u {
+  display: flex; align-items: baseline; justify-content: space-between; gap: 8px;
+  padding: 3px 8px; border-radius: 6px;
+  background: color-mix(in srgb, var(--ink) 5%, transparent);
+}
+.ugrid .k { color: var(--ink-3); white-space: nowrap; }
+.ugrid .n { font-family: var(--mono); font-variant-numeric: tabular-nums; text-align: right; white-space: nowrap; }
+.ugrid .n.hot { color: var(--warn); font-weight: 600; }
+/* 响应性能格：三行「标签 值」（总耗时 / 首字 / 速度），与用量格同构。 */
+.perf { display: grid; grid-template-columns: auto 1fr; gap: 4px 9px; font-size: 12px; }
+.perf .k { color: var(--ink-3); white-space: nowrap; }
+.perf .n { font-family: var(--mono); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.perf .n.slow { color: var(--warn); font-weight: 600; }
+/* 状态点：彩色圆点 + 状态码，429 之类一眼认得出。 */
+.sdot { width: 7px; height: 7px; border-radius: 50%; display: inline-block; margin-right: 6px; vertical-align: 1px; }
+.sdot.ok { background: var(--ok); }
+.sdot.warn { background: var(--warn); }
+.sdot.bad { background: var(--bad); }
+.sdot.mute { background: var(--ink-3); }
+.ulog .sm { font-size: 11.5px; color: var(--ink-3); margin-top: 2px; font-family: var(--mono); }
+
+@media (max-width: 760px) {
+  .shell { grid-template-columns: 1fr; }
+  .nav { position: static; height: auto; flex-direction: row; align-items: center; overflow-x: auto; }
+  .nav ul { display: flex; padding: 8px; } .nav .sig { border: none; }
+  .topbar { padding: 20px 16px 4px; }
+  .topbar h2 { font-size: 24px; }
+  .view { padding: 12px 16px 48px; }
+}
+/* ── 仪表盘纵向压缩 ──────────────────────────────────────────────────
+   用户反馈：各板块占面积太大，看下面的表要往下滑好久。
+
+   实测（1440×900 视口，内容总高 1580px）：
+     viz-grid 392 · 三行 KPI 388 · 两张表 276 · 顶栏接口条 66 · 其余为间距
+   所以压缩按"占得多"的顺序来：先图表、再 KPI、再表格。
+
+   全部**只作用于 #view-dashboard**：账号池/任务那些页的 .stat / .box / .acc
+   有自己的疏密需求（那里一张表要读几十行），全局调密会把它们一起弄挤。 */
+#view-dashboard .stat { min-height: 86px; padding: 12px 14px; }
+/* 英雄卡是首行锚点，改横向后保持紧凑高度。 */
+#view-dashboard .stat.hero { min-height: 84px; padding: 14px 18px; }
+/* 标签与数字之间的留白收掉一半：那 12px 在 5 列并排时纯属浪费。 */
+#view-dashboard .stat .k { margin-bottom: 7px; }
+#view-dashboard .stat .sub { margin-top: 4px; }
+#view-dashboard .stats { margin-bottom: 10px; }
+/* 三行 KPI 之间原本各隔 16px，收成 10px；三行合计省下约 18px。 */
+#view-dashboard .stats + .stats { margin-top: -6px; }
+#view-dashboard .viz-grid { margin-bottom: 12px; }
+#view-dashboard .box { margin-bottom: 10px; }
+#view-dashboard .box > header { padding-top: 12px; }
+@media (min-width: 900px) { #view-dashboard .box > header { padding: 14px 20px 0; } }
+/* 表格行高：12px 上下内边距在数据行上是"每行多占 8px"，
+   模型/密钥表各 4 行就是 64px。 */
+#view-dashboard .acc th { padding: 7px 16px; }
+#view-dashboard .acc td { padding: 8px 16px; }
+#view-dashboard .access-bar { margin-bottom: 12px; }
+/* viz 卡内部：构成条与图例靠紧，时序标题的上边距从 20px 收到 12px。
+   这两处都是纯留白，收掉不影响可读性。 */
+#view-dashboard .stack { margin: 10px 0 8px; }
+#view-dashboard .chart { padding: 8px 10px 0; }
+
+/* ── 迁移视图样式（任务中心 / 积分构成 / 券码弹窗）──
+   来源：v1.11 前端（按选择器块整体提取，勿手工截断多行规则）。类名与 JS 生成保持一致。 */
+.tc-empty { display: flex; flex-direction: column; align-items: center; gap: 6px; padding: 42px 16px; color: var(--ink-3); }
+.tc-empty svg { width: 42px; height: 42px; opacity: .55; margin-bottom: 6px; }
+.tc-empty .t { font-weight: 550; color: var(--ink-2); }
+.tc-empty .d { font-size: 12.5px; max-width: 34em; text-align: center; }
+.sel-note { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--ink-3); white-space: nowrap; flex: none; }
+.sel-note select {
+  appearance: none; -webkit-appearance: none;
+  background: var(--surface-2) url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='%23888' stroke-width='1.6' stroke-linecap='round'/%3E%3C/svg%3E") no-repeat right 8px center;
+  border: 1px solid var(--line); border-radius: 7px; color: var(--ink);
+  font: 550 12px var(--sans); padding: 3px 24px 3px 9px; cursor: pointer;
+}
+.qprog { display: flex; align-items: center; gap: 12px; padding: 12px 16px 0; }
+.qprog .qbar { flex: 1; height: 4px; border-radius: 3px; background: var(--surface-2); overflow: hidden; }
+.qprog .qbar i { display: block; height: 100%; width: 0; background: var(--accent); border-radius: 3px; transition: width .5s ease; }
+.qprog .note { font-variant-numeric: tabular-nums; white-space: nowrap; }
+.qgroup { padding: 4px 0 10px; }
+.qgroup + .qgroup { border-top: 1px solid var(--line-soft); }
+.qgroup header {
+  display: flex; align-items: baseline; gap: 9px; padding: 10px 16px 6px;
+  background: none; border: none; box-shadow: none;
+}
+.qgroup header .nm { font-weight: 600; font-size: 13.5px; }
+.qgroup header .cnt { font-size: 12px; color: var(--ink-3); font-variant-numeric: tabular-nums; }
+.qrow {
+  display: grid; grid-template-columns: 118px 1fr 52px 84px minmax(120px, 240px);
+  gap: 10px; align-items: center; padding: 7.5px 16px; font-size: 13px;
+}
+.qrow:hover { background: var(--surface-2); }
+.qrow .code { font: 11.5px/1.35 var(--mono); color: var(--ink-3); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.qrow .name { display: flex; align-items: center; gap: 7px; min-width: 0; }
+.qrow .name .t { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.qrow .prog { font-variant-numeric: tabular-nums; color: var(--ink-2); text-align: right; }
+.qrow .st { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+.qrow .msg { font-size: 12px; color: var(--ink-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.qdot { width: 7px; height: 7px; border-radius: 50%; flex: none; }
+.qdot.done { background: var(--ok); }
+.qdot.run { background: var(--accent); animation: qpulse 1.2s ease-in-out infinite; }
+.qdot.wait { background: none; border: 1.5px solid var(--ink-3); }
+.qdot.err { background: var(--bad); }
+.qdot.skip { background: var(--ink-3); }
+.srow { display: grid; grid-template-columns: minmax(150px, 210px) 1fr auto; gap: 14px; align-items: center; padding: 13px 16px; }
+.srow + .srow { border-top: 1px solid var(--line-soft); }
+.srow .who .nm { font-weight: 600; font-size: 13.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.srow .who .id { font: 10.5px var(--mono); color: var(--ink-3); margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.shead {
+  display: grid; grid-template-columns: minmax(150px, 210px) 1fr auto;
+  gap: 14px; align-items: center; padding: 9px 16px 7px;
+  font-size: 11.5px; color: var(--ink-3); border-bottom: 1px solid var(--line-soft);
+}
+.shead .stasks span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.stasks { display: grid; grid-template-columns: repeat(5, minmax(64px, 1fr)); gap: 6px 10px; }
+.stask { display: inline-flex; align-items: center; gap: 6px; font-size: 12.5px; color: var(--ink-2); }
+.stask .mark { font-size: 13px; line-height: 1; width: 14px; text-align: center; flex: none; }
+.stask.ok .mark { color: var(--ok); }
+.stask.warn .mark { color: var(--warn); } .stask.warn .fr { color: var(--warn); font-variant-numeric: tabular-nums; }
+.stask.todo { color: var(--ink-3); }
+.srow .luck { display: flex; align-items: center; gap: 5px; font-size: 12.5px; color: var(--ink-2); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.srow .luck svg { width: 14px; height: 14px; opacity: .7; }
+.srow .err { grid-column: 1 / -1; font-size: 12px; color: var(--bad); margin-top: -4px; }
+.bar { height: 3px; background: var(--line); border-radius: 2px; margin-top: 5px; overflow: hidden; max-width: 88px; }
+.bar i { display: block; height: 100%; background: var(--accent); border-radius: 2px; }
+.state { font-size: 13px; color: var(--ink-2); display: flex; align-items: center; gap: 8px; }
+.state.ok { color: var(--ok); } .state.err { color: var(--bad); }
+.dots::after { content: "…"; animation: blink 1.2s steps(4) infinite; }
+.vc-acct:first-child { margin-top: 4px; }
+.vc-acct .nm { font-weight: 650; font-size: 13px; color: var(--ink-2); }
+.vc:hover { border-color: var(--accent); }
+.vc .hd { display: flex; align-items: center; gap: 8px; padding: 12px 14px 4px; }
+.vc .hd .nm { font-weight: 640; font-size: 14px; }
+.vc .hd .tag { margin-left: auto; }
+.vc .meta { padding: 2px 14px 10px; font-size: 11.5px; color: var(--ink-3); }
+.vc .sep { border-top: 1px dashed var(--line); margin: 0 12px; }
+.vc .ft { display: flex; align-items: center; gap: 12px; padding: 10px 14px; }
+.vc .ft .lab { font-size: 11.5px; color: var(--ink-3); flex: none; }
+.vc .ft .acts { margin-left: auto; display: flex; gap: 8px; flex: none; }
+.vc .vc-qr { border-top: 1px dashed var(--line); padding: 14px; display: flex; justify-content: center; }
+.vc .vc-qr svg { border-radius: 6px; }
+.vc.expired { border-style: dashed; }
+.vc.expired .hd, .vc.expired .meta { opacity: .55; }
+  /* ── 积分构成：每个账号一张卡（v2 改版：独立卡片 + 消耗条）────── */
+  .pk-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(330px, 1fr)); gap: 12px; }
+  .pk-card { border: 1px solid var(--line-soft); border-radius: 10px; padding: 14px 16px;
+    background: var(--surface); display: flex; flex-direction: column; gap: 10px; }
+  .pk-card:hover { border-color: var(--line); }
+  /* 头部：账号名 + 域徽标。
+     注意 max-width: none —— 全局 .who（账号表用的）限死 200px，
+     在卡片里会把 11 位手机号挤成「189221150…」。卡片整行都是自己的，放开它；
+     昵称仍然可省略号收尾（超长昵称），但副标题/域/排名不参与收缩。 */
+  .pk-card .who { display: flex; align-items: baseline; gap: 8px; max-width: none; min-width: 0; }
+  .pk-card .nm { font-weight: 650; font-size: 14px; min-width: 0; overflow: hidden;
+    text-overflow: ellipsis; white-space: nowrap; }
+  .pk-card .who .lg-n { flex: none; }
+  .pk-card .realm { font-size: 10.5px; color: var(--ink-3); font-family: var(--mono);
+    border: 1px solid var(--line-soft); border-radius: 4px; padding: 1px 5px; flex: none; }
+  .pk-card .rank { margin-left: auto; font: 10.5px var(--mono); color: var(--ink-3); flex: none; }
+  /* 主数字：剩余积分 */
+  .pk-card .hero { display: flex; align-items: baseline; gap: 8px; }
+  .pk-card .big { font: 650 27px/1 var(--mono); font-variant-numeric: tabular-nums; }
+  .pk-card .unit { font-size: 12px; color: var(--ink-3); }
+  .pk-card .sub { font-size: 11.5px; color: var(--ink-3); }
+  /* 消耗条：已用（实心）+ 剩余（浅色），一眼看出消耗比例 */
+  .pk-card .usage-bar { height: 8px; border-radius: 5px; overflow: hidden;
+    background: var(--surface-2); display: flex; }
+  .pk-card .usage-bar i { display: block; height: 100%; }
+  .pk-card .usage-bar .used { background: var(--accent); }
+  .pk-card .usage-bar .left { background: var(--line); }
+  .pk-card .usage-meta { display: flex; justify-content: space-between;
+    font-size: 11.5px; color: var(--ink-3); font-variant-numeric: tabular-nums; }
+  .pk-card .usage-meta b { color: var(--ink-2); font-weight: 600; }
+  /* 来源构成：堆叠条 + 图例 */
+  .pk-card .src-title { font-size: 11.5px; color: var(--ink-3); margin-top: 2px; }
+  .pk-card .mixbar { display: flex; height: 7px; border-radius: 4px; overflow: hidden;
+    background: var(--surface-2); }
+  .pk-card .mixbar i { display: block; height: 100%; }
+  .pk-legend { display: flex; flex-direction: column; gap: 5px; font-size: 11.5px; }
+  .pk-legend span { display: flex; align-items: center; gap: 6px; }
+  .pk-legend i { width: 9px; height: 9px; border-radius: 2px; display: inline-block; flex: none; }
+  .pk-legend .lg-n { color: var(--ink-3); font-family: var(--mono); font-size: 10.5px; }
+  .pk-legend .lg-v { margin-left: auto; font-variant-numeric: tabular-nums; color: var(--ink-2); }
+  .pk-card .err { color: var(--warn); font-size: 12px; }
+</style>
+</head>
+<body>
+<div class="shell">
+  <nav class="nav">
+    <div class="brand">
+      <div class="mark" aria-hidden="true">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="8" cy="8" r="5.2"/><circle cx="8" cy="8" r="1.6" fill="currentColor" stroke="none"/></svg>
+      </div>
+      <div>
+        <div class="name">WorkBuddy</div>
+        <div class="sub" id="navSub">控制台</div>
+      </div>
+    </div>
+    <ul>
+      <li><a href="#dashboard" data-view="dashboard" class="on">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><rect x="2.2" y="2.2" width="5" height="5" rx="1"/><rect x="8.8" y="2.2" width="5" height="5" rx="1"/><rect x="2.2" y="8.8" width="5" height="5" rx="1"/><rect x="8.8" y="8.8" width="5" height="5" rx="1"/></svg>
+        仪表盘</a></li>
+      <li><a href="#usage" data-view="usage">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><rect x="2.2" y="2.6" width="11.6" height="10.8" rx="1.6"/><path d="M2.2 6h11.6M5.6 6v7.4M9.6 6v7.4"/></svg>
+        请求审计</a></li>
+      <li><a href="#packages" data-view="packages">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M2.4 5.2 8 2.2l5.6 3v5.6L8 13.8l-5.6-3z"/><path d="M2.4 5.2 8 8.2l5.6-3M8 8.2v5.6"/></svg>
+        积分构成</a></li>
+      <li><a href="#accounts" data-view="accounts">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="6" cy="5.4" r="2.2"/><path d="M2.4 13.2c.5-2.3 2.2-3.5 3.6-3.5s3.1 1.2 3.6 3.5"/><circle cx="11.2" cy="6" r="1.8"/><path d="M10.2 13.2c.3-1.6 1.4-2.5 2.4-2.5"/></svg>
+        账号</a></li>
+      <li><a href="#models" data-view="models">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M8 1.8 14 5v6L8 14.2 2 11V5z"/><path d="M2 5l6 3.2L14 5M8 8.2v6"/></svg>
+        模型</a></li>
+      <li><a href="#keys" data-view="keys">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"><circle cx="5.6" cy="5.6" r="2.8"/><path d="M7.7 7.7 13.4 13.4M11 11l-1.6 1.6M13.4 13.4l1.2-1.2"/></svg>
+        密钥</a></li>
+      <li><a href="#checkin" data-view="checkin">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><rect x="2.4" y="3.2" width="11.2" height="10.6" rx="1.6"/><path d="M2.4 6.2h11.2M5.2 2.4v2M10.8 2.4v2"/><path d="M5.6 9.2l1.6 1.6 3.2-3.4"/></svg>
+        任务管理</a></li>
+      <li><a href="#taskcenter" data-view="taskcenter">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M3 2.5h10v9H8l-3 3v-3H3z"/><path d="M6 6.5h4M6 9h2.5"/></svg>
+        任务中心</a></li>
+      <li><a href="#logs" data-view="logs">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M2.5 3.5h11M2.5 8h11M2.5 12.5h7"/></svg>
+        运行日志</a></li>
+      <li><a href="#config" data-view="config">
+        <!-- 齿轮（Lucide settings 的路径）。原来画的是「圆心 + 8 条放射线」——
+             那是**太阳**不是齿轮：齿轮的齿必须和轮体连成一体，放射线是光。
+             16px 下要在 24 的坐标系里画，描边宽度按 24/16 放大到 1.9 才和邻居一样粗。 -->
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/></svg>
+        设置</a></li>
+    </ul>
+    <div class="sig">
+      <div class="row"><span class="pulse" id="navPulse"></span><span id="navState">连接中</span></div>
+      <div class="row" style="margin-top:6px">
+        <span class="sig-k">并发</span>
+        <span class="sig-v" id="navInflight">0</span>
+        <span class="sig-now" id="navInflightWho"></span>
+      </div>
+      <div class="row" style="margin-top:5px"><span id="navVer">v-</span> · <span id="navRedis">-</span></div>
+    </div>
+  </nav>
+
+  <div class="main">
+    <div class="topbar">
+      <div class="topbar-in">
+        <div class="topbar-row">
+          <h2 id="ttl">仪表盘</h2>
+          <span class="sep">/</span>
+          <span class="meta" id="subMeta">-</span>
+          <div class="grow"></div>
+          <!-- 域视图开关：切换"你在看哪个域"，所有按域展示的页面跟着切（账号/模型/积分构成/请求审计…）。
+               只影响看数据，不影响请求路由（模型走哪个域由后端的默认域/逐个钉决定）。
+               「全部」是默认档，也是排障时看全局的入口。 -->
+          <div class="chips" id="realmSwitch" title="面板视图按域过滤：只影响看哪些数据，不影响请求实际走哪个域"></div>
+          <button class="icon ghost" id="btnTheme" title="切换到深色" aria-label="切换主题">
+            <svg id="icoTheme" viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M13.2 9.6A5.6 5.6 0 0 1 6.4 2.8a5.6 5.6 0 1 0 6.8 6.8z"/></svg>
+          </button>
+          <button id="btnRefresh">刷新</button>
+          <button id="btnRestart">重启</button>
+          <button class="primary" id="btnAdd" hidden>添加账号</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 仪表盘 -->
+    <section class="view" id="view-dashboard">
+      <!-- 域开关切到某一域时的诚实提示：仪表盘统计来自进程级累计（metrics），目前没有域维度，
+           所以这里仍是两域合计。不做假拆分——把两域数字"看起来像单域"是更糟的误导。 -->
+      <div class="box" id="dashRealmNote" hidden>
+        <div class="pad" style="padding:12px 16px">
+          <span class="hint" id="dashRealmNoteText"></span>
+        </div>
+      </div>
+      <div class="access-bar">
+        <div class="access-item">
+          <span class="lb">接口</span>
+          <code class="url" id="dashBase">http://127.0.0.1:7863/v1</code>
+          <button type="button" class="xs ghost" id="btnCopyBase">复制</button>
+        </div>
+        <div class="access-item">
+          <span class="lb">密钥</span>
+          <span class="url" id="dashKeyHint">与面板同一把</span>
+          <button type="button" class="xs ghost" id="btnCopyKey">复制密钥</button>
+        </div>
+        <!-- 到期提醒：只显示"最快到期的一条"，点开看完整清单。
+             放在顶栏右端是因为它是"要行动"的信息；只留一条是因为完整列出会把顶栏撑高。 -->
+        <button type="button" class="expiry-chip" id="dashExpiry" hidden></button>
+      </div>
+      <!-- 首行英雄 KPI：全页视觉锚点（彩色图标芯片 + 大数字），渲染见 app.js kpiCard() -->
+      <div class="stats c4" id="dashCards"></div>
+      <!-- 用量趋势（7 天 / 24 小时切换）+ 模型占比：仪表盘的「宏观层」。
+           原来两张时序图各占一张卡上下铺开，整页被拉得很长；合并成卡内切换后
+           首屏能多容纳一整行内容。趋势数据来自 /panel/api/trend，60 秒节流拉取。 -->
+      <div class="viz-grid">
+        <div class="viz-card">
+          <div class="viz-h">
+            用量趋势
+            <span class="grow"></span>
+            <span class="sub" id="dashTrendNote"></span>
+          </div>
+          <div class="chart-wrap" id="trendWrap">
+            <div class="chart" id="dashTrend"></div>
+            <div class="chart-cursor" id="trendCursor" hidden></div>
+            <div class="pop chart-tip" id="trendTip" hidden></div>
+          </div>
+          <div class="chart-x">
+            <span class="ch-lg"><i class="ch-sw"></i><span id="dashTrendTok">用量 —</span></span>
+            <span class="ch-lg"><i class="ch-sw ch-sw-ln2"></i><span id="dashTrendReq">请求 —</span></span>
+          </div>
+        </div>
+        <div class="viz-card">
+          <div class="viz-h">模型占比<span class="grow"></span><span class="sub" id="dashDonutSub">累计 token</span></div>
+          <div id="dashDonut"></div>
+        </div>
+      </div>
+      <!-- 近 14 天积分流水（宽位）+ 积分概览：流量与存量放一行。
+           宽卡在前，吃默认的 1.85fr 列宽；窄卡在后。 -->
+      <div class="viz-grid">
+        <div class="viz-card">
+          <div class="viz-h">近 14 天积分流水<span class="grow"></span><span class="sub" id="dashBurnSub"></span></div>
+          <div class="chart-wrap" id="flowWrap">
+            <div class="chart" id="dashCreditBurn"></div>
+            <div class="chart-cursor" id="flowCursor" hidden></div>
+            <div class="pop chart-tip" id="flowTip" hidden></div>
+          </div>
+        </div>
+        <div class="viz-card">
+          <div class="viz-h">积分概览<span class="grow"></span><span class="sub" id="dashCreditAge"></span></div>
+          <div id="dashCreditViz"></div>
+        </div>
+      </div>
+      <!-- 单价与性能：一条紧凑指标带。此前是 8 张与首行同质的数字卡——
+           同屏 13 张一样的卡片既重复又占面积。收敛成两行内联指标：
+           上行单价推算（dashCredit）、下行性能与质量（dashQuality），
+           缓存率不单列（token 构成图例与按模型表已各有一份）。 -->
+      <div class="box stripbox">
+        <header><h3>单价与性能</h3><span class="grow"></span><span class="note">悬停各项看口径</span></header>
+        <div class="mstrip" id="dashCredit"></div>
+        <div class="mstrip hairline" id="dashQuality"></div>
+      </div>
+
+      <div class="box">
+        <header>
+          <h3>按模型</h3>
+          <span class="grow"></span>
+          <span class="note" id="dashNote">累计用量 · 重启保留</span>
+        </header>
+        <div class="tbl-wrap">
+          <table class="acc w">
+            <thead><tr>
+              <th>模型</th><th>请求</th><th>输入</th><th>输出</th><th>合计</th>
+              <th>占比</th><th>缓存命中</th><th>缓存率</th><th>积分/Mtok</th><th>平均·请求</th><th>tok/s</th><th>TTFB</th><th>错误</th>
+            </tr></thead>
+            <tbody id="dashModelBody"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="box">
+        <header>
+          <h3>按密钥</h3>
+          <span class="grow"></span>
+          <span class="note" id="dashKeyNote"></span>
+        </header>
+        <div class="tbl-wrap">
+          <table class="acc sm-t">
+            <thead><tr>
+              <th>密钥</th><th>请求</th><th>输入</th><th>输出</th><th>合计</th><th>消耗积分</th><th>平均·请求</th><th>错误</th>
+            </tr></thead>
+            <tbody id="dashKeyBody"></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- 账号池 -->
+    <section class="view" id="view-accounts" hidden>
+      <div class="stats">
+        <div class="stat"><div class="v" id="sTotal">-</div><div class="k">账号总数</div></div>
+        <div class="stat good"><div class="v" id="sHealthy">-</div><div class="k">可用</div></div>
+        <div class="stat warn"><div class="v" id="sCooling">-</div><div class="k">冷却中</div></div>
+        <div class="stat bad"><div class="v" id="sDisabled">-</div><div class="k">已禁用</div></div>
+        <div class="stat"><div class="v" id="sCredits">-</div><div class="k">可用积分合计</div></div>
+        <div class="stat"><div class="v" id="sSticky">-</div><div class="k">粘性会话</div></div>
+      </div>
+
+      <div class="box">
+        <header>
+          <h3>账号管理</h3>
+          <span class="grow"></span>
+          <span class="note" id="accNote"></span>
+          <button class="xs" id="btnDeadAudit">死号自检</button>
+          <button class="xs" id="btnActivateGlobal" title="对全部国际服账号跑一遍：补地区 → 注册激活 → 领 trial 积分 → 刷新余额（幂等，可反复点）">激活国际服</button>
+          <button class="xs" id="btnReviveAll" hidden>批量解冻</button>
+          <button class="xs ghost danger" id="btnRemoveDisabled" hidden>清理禁用号</button>
+        </header>
+        <!-- 这三个按钮的作用不是自明的（尤其「死号自检」和「批量解冻」怎么选），
+             但按钮本身有文字，再浮提示就是噪音。所以把说明**写在页面上**——
+             比藏在悬停里更容易被发现，代价只有三行。 -->
+        <div class="pad" style="padding:10px 20px 0">
+          <div class="hint" style="font-size:12px;color:var(--ink-3);line-height:1.8">
+            <b>死号自检</b>：对禁用号尝试刷新 token——刷新成功说明 session 没死、之前的 12153 是误判，自动复活（保活排程每天也会自动跑一次）。<br>
+            <b>批量解冻</b>：无条件恢复全部禁用号（清禁用 + 冷却 + 熔断 + 12153 计数）。只想救回误判号的话，先用「死号自检」更精准。<br>
+            <b>清理禁用号</b>：永久移除并删除 <code>auths/</code> 下的凭证文件（不可撤销，需重新登录才能再用）。
+          </div>
+        </div>
+        <div class="toolbar">
+          <input class="search" id="accSearch" placeholder="搜索别名 / 昵称 / uid" autocomplete="off">
+          <div class="chips" id="accChips"></div>
+          <span class="grow"></span>
+          <select class="mini" id="accSort">
+            <option value="health">按健康度</option>
+            <option value="credits">按积分</option>
+            <option value="name">按名称</option>
+          </select>
+          <span class="note" id="accCount"></span>
+        </div>
+        <div class="tbl-wrap">
+        <table class="acc">
+          <thead><tr>
+            <th class="mark" aria-hidden="true"></th>
+            <th>账号</th><th>状态</th><th>健康度</th><th>积分</th>
+            <th>成功 / 失败</th><th>并发</th><th>验活</th><th>最近成功</th><th class="c-acts"></th>
+          </tr></thead>
+          <tbody id="accBody"></tbody>
+        </table>
+        </div>
+      </div>
+
+    </section>
+
+    <!-- 任务管理（签到 / 旅行 / 活跃 / 保活 / 官方任务） -->
+    <section class="view" id="view-checkin" hidden>
+      <!-- 国际服模式下：这套体系只存在于国内服。用 CSS 把本页其余卡片收起（见 .realm-global 规则），
+           只留这条说明——比"页面报一堆错/显示一堆空数字"清楚得多。 -->
+      <div class="box cn-only-note">
+        <div class="pad"><div class="empty">签到 / 任务 / 猫猫旅行 / 连登是<b>国内服专属</b>体系，国际服没有这些。</div>
+          <div class="hint" style="margin-top:8px">切到顶部「国服」或「全部」查看；国际服账号的积分请走「账号」页的「激活」（领 trial 加油包）。</div></div>
+      </div>
+      <div class="stats c4" id="ckStats">
+        <div class="stat good"><div class="v" id="ckSigned">-</div><div class="k">今日已签</div></div>
+        <div class="stat"><div class="v" id="ckPending">-</div><div class="k">未签</div></div>
+        <div class="stat"><div class="v" id="ckTodaySum">-</div><div class="k">今日积分</div></div>
+        <div class="stat"><div class="v" id="ckMonthSum">-</div><div class="k">当月累计</div></div>
+      </div>
+      <div class="box">
+        <header>
+          <h3>任务与签到</h3>
+          <span class="grow"></span>
+          <span class="note">定时 <b id="ckWhen">-</b></span>
+          <button class="xs" id="btnCkOn">启用</button>
+          <button class="xs" id="btnCkOff">关闭</button>
+          <button class="xs primary" id="btnCheckinAll">全部签到</button>
+          <button class="xs" id="btnAutoAll">全部账号做任务</button>
+          <details class="more">
+            <summary>更多</summary>
+            <div class="pop more-menu">
+              <button type="button" class="xs" id="btnTravelAll">旅行巡检</button>
+              <button type="button" class="xs" id="btnActivityAll">活跃上报</button>
+              <button type="button" class="xs" id="btnKeepaliveAll">全部保活</button>
+            </div>
+          </details>
+        </header>
+        <div class="toolbar">
+          <input class="search" id="ckSearch" placeholder="搜索账号" autocomplete="off">
+          <div class="chips" id="ckChips"></div>
+          <span class="grow"></span>
+          <span class="note" id="ckCount"></span>
+        </div>
+        <div class="tbl-wrap">
+          <table class="acc ck">
+            <thead><tr>
+              <th>账号</th><th>属性</th><th>今日状态</th><th>今日积分</th>
+              <th>当月累计</th><th>当前积分</th><th>最后签到日</th><th class="c-acts"></th>
+            </tr></thead>
+            <tbody id="ckBody"></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- 任务中心（开学季闭环 + 成长任务队列）——从 v1.11 前端移植 -->
+    <section class="view" id="view-taskcenter" hidden>
+      <div class="box cn-only-note">
+        <div class="pad"><div class="empty">开学季 / 成长任务 / 券码都是<b>国内服专属</b>活动，国际服没有。</div>
+          <div class="hint" style="margin-top:8px">切到顶部「国服」或「全部」查看。</div></div>
+      </div>
+      <div class="box">
+        <header>
+          <h3>开学季 <span class="hint">09-13 ~ 09-24 · 每日重置</span></h3>
+          <span class="grow"></span>
+          <span class="note" id="schoolSummary"></span>
+          <button class="xs" id="btnSchoolVouchers">查询券码</button>
+          <button class="xs" id="btnSchoolRefresh">刷新</button>
+          <button class="xs primary" id="btnSchoolRunAll">全部账号执行闭环</button>
+        </header>
+        <div class="state" id="schoolState"><span class="dots">加载中</span></div>
+        <div id="schoolList"></div>
+      </div>
+
+      <div class="box">
+        <header>
+          <h3>成长任务队列 <span class="hint" id="qcSummary"></span></h3>
+          <span class="grow"></span>
+          <label class="sel-note">并发
+            <select id="qcConc"><option value="1" selected>1</option><option value="2">2</option><option value="3">3</option></select>
+          </label>
+          <button class="xs" id="btnScanAll">扫描待办</button>
+          <button class="xs primary" id="btnRunQueue">执行全部待办</button>
+        </header>
+        <div class="qprog" id="qProg" hidden>
+          <div class="qbar"><i id="qBarFill"></i></div>
+          <span class="note" id="qProgText"></span>
+        </div>
+        <div class="tc-empty" id="tcEmpty">
+          <svg viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+            <rect x="8" y="6" width="24" height="36" rx="3"/>
+            <path d="M14 16h12M14 24h12M14 32h7" opacity=".45"/>
+            <circle cx="35" cy="33" r="8"/><path d="m40 38 5 5"/>
+          </svg>
+          <div class="t">还没有扫描过</div>
+          <div class="d">扫描所有账号的成长任务与开学季待办，把没做的排成一列，一键执行。</div>
+        </div>
+        <div id="qcList"></div>
+      </div>
+    </section>
+
+    <!-- 模型与档位 -->
+    <section class="view" id="view-models" hidden>
+      <div class="box">
+        <header>
+          <h3>模型能力</h3>
+          <span class="grow"></span>
+          <span class="note" id="mdNote">实时查询上游</span>
+          <button class="xs" id="btnModels">重新获取</button>
+        </header>
+        <!-- 域筛选：与账号页 chips 同一套样式/交互。模型 id 自带 cn:/global: 前缀，
+             前端拆前缀过滤即可，后端无需改。 -->
+        <div class="pad" style="padding-bottom:0"><div class="chips" id="mdChips"></div></div>
+        <div class="tbl-wrap">
+        <table class="acc md">
+          <thead><tr><th class="mark" aria-hidden="true"></th><th>模型</th><th>积分倍率</th><th>默认档</th><th>支持的思考档位</th><th>上下文长度</th><th>最大输出</th></tr></thead>
+          <tbody id="mdBody"></tbody>
+        </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- 配置 -->
+    <section class="view" id="view-config" hidden>
+      <form id="cfgForm">
+        <div class="box">
+          <header><h3>服务</h3><span class="grow"></span><span class="note" id="cfgPath"></span></header>
+          <div class="pad">
+            <div class="grid2">
+              <label class="fld"><span class="lb">端口 / 监听地址</span>
+                <input name="listen" placeholder="127.0.0.1:7863">
+                <span class="hint">只改冒号后面的数字就是换端口，例如 127.0.0.1:8080。保存后要点右上角「重启」，然后用新地址打开面板。</span></label>
+              <label class="fld"><span class="lb">默认密钥（也是面板登录密码）</span>
+                <div class="inline"><input name="api_key" id="cfgKey" type="password" placeholder="留空 = 不鉴权">
+                <button type="button" class="xs" id="btnEye">显示</button></div>
+                <span class="hint">你自己用的那一把：调 /v1 和登录这个面板都靠它。给别人用的密钥在「密钥」页管理。</span></label>
+            </div>
+            <div class="hr"></div>
+            <label class="fld" style="max-width:340px"><span class="lb">默认密钥显示名</span>
+              <input name="api_key_name" placeholder="主号">
+              <span class="hint">「请求审计」里用这个名字标出你自己的用量；留空显示「默认」</span></label>
+          </div>
+        </div>
+
+        <div class="box">
+          <header><h3>定时任务</h3></header>
+          <div class="pad">
+            <div class="grid2">
+              <div>
+                <div class="switch"><span class="lb">自动签到</span>
+                  <input type="checkbox" name="checkin_enabled"></div>
+                <label class="fld"><span class="lb">签到时点（小时，逗号分隔）</span>
+                  <input name="checkin_hours" placeholder="9, 21"></label>
+              </div>
+              <div>
+                <div class="switch"><span class="lb">Token 保活</span>
+                  <input type="checkbox" name="keepalive_enabled"></div>
+                <label class="fld"><span class="lb">保活时点（小时，逗号分隔）</span>
+                  <input name="keepalive_hours" placeholder="22"></label>
+              </div>
+            </div>
+            <div class="hr"></div>
+            <div class="grid2">
+              <div>
+                <div class="switch"><span class="lb">猫猫旅行</span>
+                  <input type="checkbox" name="travel_enabled"></div>
+                <label class="fld"><span class="lb">旅行时点（小时，逗号分隔）</span>
+                  <input name="travel_hours" placeholder="9, 21">
+                  <span class="hint">一趟派出 + 一趟领奖闭环</span></label>
+              </div>
+              <div>
+                <div class="switch"><span class="lb">活跃上报</span>
+                  <input type="checkbox" name="activity_enabled"></div>
+                <label class="fld"><span class="lb">上报时点（小时，逗号分隔）</span>
+                  <input name="activity_hours" placeholder="10">
+                  <span class="hint">点亮连登 + 解锁领养前置</span></label>
+              </div>
+            </div>
+            <div class="hr"></div>
+            <div class="grid2">
+              <div>
+                <div class="switch"><span class="lb">夜猫子</span>
+                  <input type="checkbox" name="blackcat_enabled"></div>
+                <label class="fld"><span class="lb">夜猫子时点（小时，逗号分隔）</span>
+                  <input name="blackcat_hours" placeholder="23">
+                  <span class="hint">23:00–08:00 窗口内补 glm-5.2 短对话</span></label>
+              </div>
+            </div>
+            <div class="hr"></div>
+            <div class="grid2">
+              <div class="switch"><span class="lb">后台刷新余额</span>
+                <input type="checkbox" name="balance_refresh_enabled"></div>
+              <label class="fld"><span class="lb">刷新间隔（分钟）</span>
+                <input name="balance_refresh_minutes" type="number" min="1" placeholder="5"></label>
+            </div>
+          </div>
+        </div>
+
+        <div class="box">
+          <header><h3>账号验活</h3></header>
+          <div class="pad">
+            <div class="hint" style="font-size:12.5px;color:var(--ink-3);line-height:1.75;margin-bottom:14px">
+              定时给每个可用账号发一次<b>极小的真实请求</b>，用「能不能真的完成一次对话」判断号还活着。
+              token 保活与死号自检都只看 token 刷新成不成功——<b>token 有效但模型被收回权限，只有验活能发现</b>。<br>
+              请求<b>直连上游、不经过网关</b>，所以不会注入系统提示词；默认用免费档 <code>hy3</code>，验活成本为 0。
+            </div>
+            <div class="grid2">
+              <div class="switch"><span class="lb">启用验活</span>
+                <input type="checkbox" name="probe_enabled"></div>
+              <label class="fld"><span class="lb">间隔（分钟）</span>
+                <input name="probe_interval_minutes" type="number" min="1" placeholder="120">
+                <span class="hint">120 = 每 2 小时一轮。账号数 × 每天轮数 = 每日探测次数</span></label>
+            </div>
+            <div class="grid2">
+              <label class="fld"><span class="lb">验活模型</span>
+                <input name="probe_model" placeholder="hy3">
+                <span class="hint">留空回落 <code>hy3</code>（免费档）。换成收费模型等于每次验活都真花积分</span></label>
+              <label class="fld"><span class="lb">验活提示词</span>
+                <input name="probe_prompt" placeholder="hi">
+                <span class="hint">越短越省</span></label>
+            </div>
+            <div class="grid2">
+              <label class="fld"><span class="lb">连续失败自动禁用阈值</span>
+                <input name="probe_fail_threshold" type="number" min="1" placeholder="3">
+                <span class="hint">达到次数即自动禁用并在账号上标注原因（面板「解冻」可恢复）。<b>想只记录不处置就填一个很大的数</b>，如 999999</span></label>
+              <label class="fld"><span class="lb">立即验活</span>
+                <button type="button" class="ghost" id="btnProbeNow">对所有可用账号验活一次</button>
+                <span class="hint">不等下一个周期，手动跑一轮；结果看账号管理页的「验活」列</span></label>
+            </div>
+          </div>
+        </div>
+
+        <div class="box">
+          <header><h3>账号池与流量治理</h3></header>
+          <div class="pad">
+            <div class="grid3">
+              <label class="fld"><span class="lb">单账号最大并发</span>
+                <input name="max_in_flight" type="number" min="0" placeholder="3">
+                <span class="hint">同一账号最多同时处理几个请求；0 = 不限制</span></label>
+              <label class="fld"><span class="lb">连续失败熔断阈值</span>
+                <input name="breaker_threshold" type="number" min="1" placeholder="3"></label>
+              <label class="fld"><span class="lb">软限流冷却基数</span>
+                <input name="soft_rate" placeholder="600s"></label>
+            </div>
+            <div class="grid3">
+              <label class="fld"><span class="lb">软冷却退避上限</span>
+                <input name="soft_rate_max" placeholder="2h"></label>
+              <label class="fld"><span class="lb">熔断基础时长</span>
+                <input name="breaker_cooldown" placeholder="30m"></label>
+              <label class="fld"><span class="lb">熔断退避上限</span>
+                <input name="breaker_cooldown_max" placeholder="6h"></label>
+            </div>
+            <div class="grid3">
+              <label class="fld"><span class="lb">闲置补偿 / 小时</span>
+                <input name="idle_weight_per_hour" type="number" step="0.1" placeholder="0.5"></label>
+              <label class="fld"><span class="lb">闲置补偿上限</span>
+                <input name="idle_weight_max" type="number" step="0.1" placeholder="5"></label>
+              <label class="fld"><span class="lb">会话粘性 TTL</span>
+                <input name="ttl" placeholder="30m">
+                <span class="hint">改动需重启进程</span></label>
+            </div>
+          </div>
+        </div>
+
+        <div class="box">
+          <header><h3>上游与高级</h3></header>
+          <div class="pad">
+            <div class="grid3">
+              <label class="fld"><span class="lb">短请求超时</span>
+                <input name="timeout_seconds" type="number" min="1" placeholder="120">
+                <span class="hint">需重启</span></label>
+              <label class="fld"><span class="lb">聊天首字节超时</span>
+                <input name="header_timeout_seconds" type="number" min="1" placeholder="120">
+                <span class="hint">需重启</span></label>
+              <label class="fld"><span class="lb">流空闲超时</span>
+                <input name="idle_timeout_seconds" type="number" min="1" placeholder="300">
+                <span class="hint">需重启</span></label>
+            </div>
+            <div class="hr"></div>
+            <div class="grid2">
+              <label class="fld"><span class="lb">出站 User-Agent</span>
+                <input name="user_agent" placeholder="留空 = CLI/2.63.2 CodeBuddy/2.63.2">
+                <span class="hint">影响官网积分记录「使用端」显示；需重启</span></label>
+            </div>
+            <div class="hr"></div>
+            <div class="grid2">
+              <label class="fld"><span class="lb">系统提示词模式</span>
+                <select name="prompt_mode">
+                  <option value="custom">custom — 网关自有提示词（避免指纹误报）</option>
+                  <option value="passthrough">passthrough — 透传客户端原始 system</option>
+                </select>
+                <span class="hint">需重启</span></label>
+              <label class="fld"><span class="lb">提示词文件路径</span>
+                <input name="prompt_file" placeholder="留空 = 内置默认提示词">
+                <span class="hint">需重启</span></label>
+            </div>
+            <div class="hr"></div>
+            <div class="switch"><span class="lb">出站请求指纹脱敏</span>
+              <input type="checkbox" name="sanitize_blacklist_fingerprints"></div>
+            <div class="switch"><span class="lb">会话粘性路由</span>
+              <input type="checkbox" name="session_sticky_enabled"></div>
+            <div class="hint" style="margin-top:10px">Upstash Redis 镜像、凭证目录与状态文件路径需手工编辑配置文件（判为重启项）。</div>
+          </div>
+        </div>
+
+        <div class="savebar">
+          <span class="grow"></span>
+          <span class="restart-note" id="cfgNote"></span>
+          <button type="button" id="btnCfgReload">放弃修改</button>
+          <button type="submit" class="primary" id="btnCfgSave">保存配置</button>
+        </div>
+      </form>
+    </section>
+
+    <!-- 日志 -->
+    <section class="view" id="view-logs" hidden>
+      <div class="box">
+        <header>
+          <h3>运行日志</h3>
+          <span class="grow"></span>
+          <span class="note" id="logNote">最近 500 行</span>
+          <button class="xs" id="btnLogPin">自动滚动：开</button>
+          <button class="xs" id="btnNotify">通知：关</button>
+          <button class="xs" id="btnLogCopy">复制</button>
+          <button class="xs" id="btnLogClear">
+            <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-1px;margin-right:2px"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-2 14a2 2 0 0 1-2 2H9a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/><path d="M9 6V4a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2v2"/></svg>
+            清屏
+          </button>
+        </header>
+        <div class="toolbar">
+          <input class="search" id="logSearch" placeholder="搜索日志内容 / 账号名" autocomplete="off">
+          <div class="chips" id="logChips"></div>
+          <span class="grow"></span>
+          <span class="note" id="logFilterNote"></span>
+        </div>
+        <div class="term">
+          <div class="term-bar">
+            <span class="term-dot rd"></span>
+            <span class="term-dot yr"></span>
+            <span class="term-dot gn"></span>
+            <span class="term-title">wb2api — 实时运行日志</span>
+            <span class="term-meta" id="termMeta">…</span>
+          </div>
+          <!-- 一键完成进度：直接解析日志里的 [i/n]，无需后端新接口 -->
+          <div id="taskProgress" class="task-prog" hidden>
+            <div class="tp-bar"><i id="tpFill"></i></div>
+            <div class="tp-text" id="tpText"></div>
+          </div>
+          <pre id="logBox" class="term-body"></pre>
+        </div>
+      </div>
+    </section>
+
+    <!-- 密钥（额外密钥的增删改；默认密钥兼面板密码在「设置」里） -->
+    <section class="view" id="view-keys" hidden>
+      <div class="box">
+        <header>
+          <h3>密钥</h3>
+          <span class="grow"></span>
+          <span class="note" id="keysNote"></span>
+          <button class="xs" id="btnKeysRefresh">刷新</button>
+          <button class="xs primary" id="btnKeyNew">新建密钥</button>
+        </header>
+        <div class="pad" style="padding-bottom:2px">
+          <div class="hint" style="font-size:12.5px;color:var(--ink-3);line-height:1.7">
+            给别人用的密钥在这里管理：他们只能调用 <b>/v1</b> 接口，<b>进不了这个面板</b>。
+            “编辑”可限制模型和这把密钥自己的并发数；“分享”会下载一个双击即连的脚本。
+            「最近 7 天」那列来自「请求审计」——<span class="warn-note"><b>删之前先看一眼还有没有人在用</b></span>。
+          </div>
+        </div>
+        <div class="tbl-wrap">
+          <table class="acc keys" id="keysTable">
+            <thead><tr>
+              <th>名字</th><th>密钥</th><th>权限</th><th>最近 7 天</th><th class="c-acts"></th>
+            </tr></thead>
+            <tbody id="keysBody"></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- 使用日志（请求审计流水，落盘保留 7 天） -->
+    <section class="view" id="view-usage" hidden>
+      <!-- 表面层次照参考设计分三层（像素实测）：
+           KPI 行 #f7f7f5 卡片 → token 条 #f9f8f8 半强度 → 表格/工具 #fdfdfd 画布。
+           以前把三层塞进同一张 #f7f7f5 面板里用发丝线分格，层次被压平了。 -->
+      <div class="pagebar">
+        <span class="note" id="useNote">保留 7 天</span>
+        <button class="xs" id="btnUseCsv">导出 CSV</button>
+        <button class="xs" id="btnUseRefresh">刷新</button>
+      </div>
+      <div class="stats c4" id="useKpi"></div>
+      <div class="tokstrip" id="useTokStrip"></div>
+      <div class="toolbar">
+        <select id="useDate" title="选择日期" class="mini"></select>
+        <div class="search-wrap">
+          <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><circle cx="7" cy="7" r="4.6"/><path d="M10.4 10.4 13.6 13.6"/></svg>
+          <input class="search" id="useSearch" placeholder="搜索模型 / 账号 / 客户端" autocomplete="off">
+        </div>
+        <div class="flt-wrap" id="fltWrap">
+          <button type="button" class="flt-btn" id="btnUseFilter" aria-haspopup="true" aria-expanded="false">
+            <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true"><path d="M2.4 4.2h11.2M4.4 8h7.2M6.6 11.8h2.8"/></svg>
+            <span>筛选</span>
+            <span class="flt-n" id="fltCount" hidden></span>
+          </button>
+          <div class="pop flt-menu" id="fltMenu" role="menu" hidden></div>
+        </div>
+        <!-- 清除筛选：只在真的筛了东西时才出现。没有它的时候想回到「全部」
+             得挨个分类点一遍，而「我筛了什么」又常常记不清。 -->
+        <button type="button" class="flt-btn" id="btnUseClear" hidden>清除筛选</button>
+        <span class="grow"></span>
+        <span class="note" id="useCount"></span>
+      </div>
+      <div class="tbl-wrap">
+        <table class="acc ulog" id="useTable">
+          <thead><tr>
+            <th>用户</th><th>模型</th><th title="这次请求最终由哪个账号转发出去的。账号池会轮换，同一秒的两条请求可能落在不同号上——想核对某个号是不是在干活就看这里。显示别名（没设别名就是手机号），悬停看完整 uid">出口</th><th>类型</th><th>状态</th>
+            <th>用量</th><th>响应性能</th><th>时间</th>
+          </tr></thead>
+          <tbody id="useBody"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- 积分构成（逐包明细，跨账号对比）——从 v1.11 前端移植 -->
+    <section class="view" id="view-packages" hidden>
+      <div class="box">
+        <header>
+          <h3>账号对比 <span class="hint">把每个账号的余额摊开成逐包明细：面额 / 剩余 / 已用 / 发放 / 到期</span></h3>
+          <span class="grow"></span>
+          <span class="note" id="pkNote">—</span>
+          <button class="xs" id="btnPkgReload">刷新</button>
+        </header>
+        <div class="pad"><div class="pk-grid" id="pkSummary"></div></div>
+      </div>
+      <div id="pkDetail"></div>
+    </section>
+  </div>
+</div>
+
+<!-- 积分任务 -->
+<div class="veil" id="taskVeil">
+  <div class="pop center dlg" style="width:940px">
+    <header>
+      <h3>积分任务 <span class="hint" id="taskWho"></span></h3>
+      <div class="hint">任务种类以官方列表为准。新任务会自动同步并标「待适配」；未适配前仍可接受、领取，完成条件需在官方客户端操作。</div>
+    </header>
+    <div class="body">
+      <div id="taskDlgProg" class="task-prog" hidden>
+        <div class="tp-bar"><i id="taskDlgFill"></i></div>
+        <div class="tp-text" id="taskDlgText"></div>
+      </div>
+      <div class="toolbar" id="taskToolbar" hidden>
+        <div class="chips" id="taskChips"></div>
+        <span class="grow"></span>
+        <span class="note" id="taskCount"></span>
+      </div>
+      <div class="state" id="taskState"><span class="dots">加载中</span></div>
+      <div class="tbl-wrap">
+        <table class="acc md" id="taskTable" hidden>
+          <thead><tr><th class="mark" aria-hidden="true"></th><th>任务</th><th>进度</th><th>奖励</th><th>状态</th><th class="c-acts"></th></tr></thead>
+          <tbody id="taskBody"></tbody>
+        </table>
+      </div>
+    </div>
+    <footer>
+      <span class="grow"></span>
+      <button id="btnTaskAcceptAll">全部接受</button>
+      <button id="btnTaskClaimAll">全部领取</button>
+      <button id="btnTaskAutoAll" class="primary">本号做任务</button>
+      <button id="btnTaskReload">重新查询</button>
+      <button id="btnCloseTask">关闭</button>
+    </footer>
+  </div>
+</div>
+
+<!-- 添加账号 -->
+<div class="veil" id="addVeil">
+  <div class="pop center dlg">
+    <header>
+      <h3>添加账号</h3>
+      <div class="hint">浏览器完成腾讯账号登录，网关自动接续签到并载入账号池，无需重启。</div>
+    </header>
+    <div class="body">
+      <!-- 选域步骤：国内版走 copilot.tencent.com，国际版走 workbuddy.ai。
+           必须显式选——选错域拿到的授权链接就是另一个域的，账号类型也跟着错。 -->
+      <div id="addPick">
+        <div class="realm-row">
+          <span class="hint" style="font-size:12px">版本：</span>
+          <label class="realm-opt"><input type="radio" name="addRealm" value="cn" checked> 国内版（CN）</label>
+          <label class="realm-opt"><input type="radio" name="addRealm" value="global"> 国际版（Global）</label>
+        </div>
+        <div class="hint" style="font-size:12px;margin-top:2px">国际版账号需先在 web 端完成注册地区选择；登录后网关自动激活并领取试用额度。</div>
+      </div>
+      <div id="addLoad" class="state" hidden><span class="dots">正在获取授权链接</span></div>
+      <div id="addReady" hidden>
+        <div class="state">在浏览器打开以下链接并登录：</div>
+        <div class="url" id="addUrl"></div>
+        <div class="state" id="addPoll"><span class="dots">等待授权完成，自动检测中</span></div>
+      </div>
+      <div id="addDone" class="state ok" hidden></div>
+      <div id="addErr" class="state err" hidden></div>
+    </div>
+    <footer>
+      <span class="grow"></span>
+      <button id="btnStartLogin" class="primary">获取授权链接</button>
+      <button id="btnCopyUrl" hidden>复制链接</button>
+      <button id="btnOpenUrl" class="primary" hidden>在浏览器打开</button>
+      <button id="btnCloseAdd">关闭</button>
+    </footer>
+  </div>
+</div>
+
+<!-- 密钥 -->
+<div class="veil" id="keyVeil" data-lock="1">
+  <div class="pop center dlg" style="width:420px">
+    <header>
+      <h3>需要访问密钥</h3>
+      <div class="hint">该网关已启用 api_key 鉴权，请输入 config.json 中的密钥。</div>
+    </header>
+    <div class="body">
+      <input type="password" id="keyInput" placeholder="api_key" autocomplete="current-password">
+      <div class="state err" id="keyErr" hidden style="margin-top:10px">密钥不正确，请重试。</div>
+    </div>
+    <footer>
+      <span class="grow"></span>
+      <button class="primary" id="btnKey">进入</button>
+    </footer>
+  </div>
+</div>
+
+<!-- 修改账号显示名称（别名） -->
+<div class="veil" id="aliasVeil">
+  <div class="pop center dlg" style="width:440px">
+    <header>
+      <h3>修改显示名称</h3>
+      <div class="hint" id="aliasWho"></div>
+    </header>
+    <div class="body">
+      <input type="text" id="aliasInput" maxlength="32" placeholder="例如：主力号 / 备用-小号" autocomplete="off">
+      <div class="hint" style="margin-top:9px">留空保存 = 恢复原始昵称。别名只影响面板显示，不改动账号本身，也不影响选号。</div>
+      <div class="state err" id="aliasErr" hidden style="margin-top:10px"></div>
+    </div>
+    <footer>
+      <button class="ghost" id="btnAliasClear">恢复原名</button>
+      <span class="grow"></span>
+      <button class="ghost" id="btnAliasCancel">取消</button>
+      <button class="primary" id="btnAliasSave">保存</button>
+    </footer>
+  </div>
+</div>
+
+<!-- 到期详情弹窗：顶栏只显示"最快到期的一条"，完整清单在这里。
+     复用 .veil/.dlg 这套已有弹窗结构，不另造一套。 -->
+<div class="veil" id="expVeil">
+  <div class="pop center dlg" style="width:520px">
+    <header>
+      <h3>积分到期明细</h3>
+    </header>
+    <div class="body">
+      <p class="cfm-text" id="expSummary"></p>
+      <div class="tbl-wrap" style="margin-top:12px">
+        <table class="acc md">
+          <thead><tr>
+            <th>到期日</th><th>剩余天数</th><th>积分</th><th>占余额</th>
+          </tr></thead>
+          <tbody id="expBody"></tbody>
+        </table>
+      </div>
+      <p class="cfm-text" style="margin-top:12px;font-size:12.5px;color:var(--ink-3)">
+        积分到期未使用会直接作废。「占余额」以当前剩余积分为分母。
+      </p>
+    </div>
+    <footer>
+      <span class="grow"></span>
+      <button class="primary" id="btnExpClose">关闭</button>
+    </footer>
+  </div>
+</div>
+
+<!-- 券码弹窗（开学季抽奖中的第三方券：KFC / 瑞幸 / 酷狗等）。
+     类名一律 vc- 前缀，防越界覆盖别的视图样式（沿用 v1.11 口径）。 -->
+<div class="veil" id="vcVeil">
+  <div class="pop center dlg" style="width:560px">
+    <header>
+      <h3>开学季 · 我的券码</h3>
+    </header>
+    <div class="body" id="vcBody">
+      <p class="cfm-text" style="font-size:12.5px;color:var(--ink-3)">
+        抽奖抽中的第三方券码到店到对应 App / 小程序兑换。二维码可直接出示扫描。
+      </p>
+    </div>
+    <footer>
+      <span class="hint" id="vcNote"></span>
+      <span class="grow"></span>
+      <button id="btnVcRefresh">刷新</button>
+      <button class="primary" id="btnVcClose">关闭</button>
+    </footer>
+  </div>
+</div>
+
+<!-- 新建 / 改名密钥弹窗。两步合一：填名字 → 生成后原地换成"展示密钥 + 复制"。
+     为什么不拆成两个弹窗：生成完立刻要复制给对方，中间夹一次关闭/打开只是多余点击。 -->
+<div class="veil" id="newKeyVeil">
+  <div class="pop center dlg" style="width:470px">
+    <header>
+      <h3 id="keyDlgTitle">新建密钥</h3>
+      <div class="hint" id="keyDlgHint">名字会出现在「请求审计」里，用来分辨是谁在用。</div>
+    </header>
+    <div class="body">
+      <div id="keyNameRow">
+        <label class="fld"><span class="lb">名字</span>
+          <input id="keyNameInput" placeholder="访客" maxlength="24" autocomplete="off">
+          <span class="hint" id="keyNameHint">例如对方的名字或称呼；留空会显示成「默认」。</span></label>
+      </div>
+      <div id="keyPolicyRows" hidden>
+        <div class="hr"></div>
+        <label class="fld"><span class="lb">允许使用的模型</span></label>
+        <div class="chips" id="keyScopeChips">
+          <button type="button" class="chip on" data-key-scope="all">全部模型</button>
+          <button type="button" class="chip" data-key-scope="selected">指定模型</button>
+        </div>
+        <div id="keyModelTools" hidden>
+          <div class="key-model-tools">
+            <input class="search" id="keyModelSearch" placeholder="搜索模型名" autocomplete="off">
+            <div class="chips" id="keyModelRealmChips"></div>
+          </div>
+        </div>
+        <div id="keyModelState" class="hint" style="margin-top:9px"></div>
+        <div id="keyModelList" class="key-model-list" hidden></div>
+        <label class="fld" style="margin-top:14px"><span class="lb">并发限制</span>
+          <input id="keyConcurrencyInput" type="number" min="0" max="100" value="0">
+          <span class="hint">只限制这把密钥；0 表示不限。达到上限时新请求返回 429，不影响其他人。</span></label>
+      </div>
+      <div id="keyDoneRow" hidden>
+        <div class="lb" style="font-size:12.5px;color:var(--ink-2);margin-bottom:5px">密钥（复制发给对方）</div>
+        <div class="url" id="keyDoneValue"></div>
+        <div class="hint" style="font-size:12px;color:var(--ink-3)">
+          对方在客户端里把 API Key 填成这一串。他只能调用 <b>/v1</b>，进不了这个面板。
+        </div>
+      </div>
+      <div class="state err" id="keyDlgErr" hidden></div>
+    </div>
+    <footer>
+      <span class="grow"></span>
+      <button class="ghost" id="btnKeyCancel">取消</button>
+      <button id="btnKeyShare" hidden>下载分享脚本</button>
+      <button class="primary" id="btnKeySubmit">生成</button>
+    </footer>
+  </div>
+</div>
+
+<!-- 确认弹窗（替代原生 confirm：原生弹窗无法改样式、文案排版也差，且会被浏览器当"网页自带"而显得廉价） -->
+<div class="veil" id="cfmVeil">
+  <div class="pop center dlg" style="width:440px">
+    <header>
+      <h3 id="cfmTitle">确认操作</h3>
+    </header>
+    <div class="body">
+      <p class="cfm-text" id="cfmText"></p>
+    </div>
+    <footer>
+      <span class="grow"></span>
+      <button class="ghost" id="btnCfmCancel">取消</button>
+      <button class="primary" id="btnCfmOk">确认</button>
+    </footer>
+  </div>
+</div>
+
+<div id="toasts"></div>
+
+<script src="app.js"></script>
+</body>
+</html>
