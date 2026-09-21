@@ -16,3 +16,10 @@ dash-preview.html
 .vscode/
 .idea/
 *.swp
+
+# 本机运维文档（含服务器地址、SSH 密钥路径、部署路径等，永不入库）
+/HANDOFF.md
+/LOCAL-FIXES.md
+/启动说明.md
+/Work-连接.bat
+/tools/
