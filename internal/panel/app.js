@@ -14,6 +14,18 @@ let refTimer = null;
 // POLL_MS 面板轮询间隔（毫秒）。日志页脚要把它写出来，所以只此一处定义——
 // 以前页脚硬编码「自动刷新 1.5s」，而真实间隔是 5s，写的和做的不一致。
 const POLL_MS = 5000;
+// APP_NAME 面板显示名。**只在这里定义一处**：侧边栏大字标题与浏览器标签都由它写。
+// 为什么不用「WorkBuddy」当标题：那是腾讯的产品名，占在标题位等于把别人的品牌当成自己的
+//（在文档里提一句属于指称性使用，没问题；占品牌位就不一样了）。
+// 用版本标识当标题的额外好处：打开面板就知道服务器跑的是哪一版。
+const APP_NAME = 'v1.11.1-panel-main';
+// applyAppName 把显示名写进侧边栏与浏览器标签（index.html 里留的是同样的文本，
+// 无 JS 时也能看到，不至于空白）。
+function applyAppName() {
+  const el = $('brandName');
+  if (el) el.textContent = APP_NAME;
+  if (document.title !== undefined) document.title = APP_NAME + ' · 非官方控制台';
+}
 // 任务队列的轮询定时器与代次。**必须在这里声明**：applyCnOnlyViews() 在模块顶层
 // 就会被调用一次（见文件末尾），若等到队列那一节才 let 声明，这里引用会撞 TDZ 直接崩
 // ——这个坑本文件已经踩过一次（见 4150 行那段注释）。
@@ -5022,6 +5034,7 @@ async function loadPackages(force) {
 
 if ($('btnPkgReload')) $('btnPkgReload').onclick = () => loadPackages(true);
 function boot() {
+  applyAppName();
   const hash = (location.hash || '#dashboard').slice(1);
   go(hash in TITLES ? hash : 'dashboard');
   start();
