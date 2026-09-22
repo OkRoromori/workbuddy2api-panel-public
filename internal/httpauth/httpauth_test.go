@@ -62,7 +62,7 @@ func TestDigestIsFixedLength(t *testing.T) {
 }
 
 func TestVerifyBearerAny(t *testing.T) {
-	keys := map[string]string{"sk-owner": "我", "sk-friend": "朋友"}
+	keys := map[string]string{"sk-owner": "我", "sk-device2": "第二台设备"}
 
 	cases := []struct {
 		name     string
@@ -71,8 +71,8 @@ func TestVerifyBearerAny(t *testing.T) {
 		wantName string
 	}{
 		{"主密钥", "Bearer sk-owner", true, "我"},
-		{"朋友的密钥", "Bearer sk-friend", true, "朋友"},
-		{"小写认证 scheme", "bearer sk-friend", true, "朋友"},
+		{"第二台设备的密钥", "Bearer sk-device2", true, "第二台设备"},
+		{"小写认证 scheme", "bearer sk-device2", true, "第二台设备"},
 		{"错误 key", "Bearer sk-nope", false, ""},
 		{"缺 Authorization 头", "", false, ""},
 		{"缺 Bearer 前缀", "sk-owner", false, ""},

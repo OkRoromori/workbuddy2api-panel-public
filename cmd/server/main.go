@@ -536,8 +536,8 @@ func auditDir(stateFile string) string {
 	return filepath.Join(filepath.Dir(stateFile), "audit")
 }
 
-// tunnelShareConfig 从环境变量组装「下载朋友连接脚本」的服务器侧信息。
-// 未配置（WB2A_TUNNEL_SSH_HOST 为空）时面板分享接口返回 501。
+// tunnelShareConfig 从环境变量组装「下载连接脚本」的服务器侧信息。
+// 未配置（WB2A_TUNNEL_SSH_HOST 为空）时该接口返回 501。
 func tunnelShareConfig(listen string) panel.TunnelShareConfig {
 	port := 0
 	if i := strings.LastIndex(listen, ":"); i >= 0 {

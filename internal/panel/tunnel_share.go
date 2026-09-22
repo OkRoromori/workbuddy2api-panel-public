@@ -15,7 +15,7 @@ import (
 	"time"
 )
 
-// TunnelShareConfig 是生成朋友连接脚本所需的服务器侧信息。
+// TunnelShareConfig 是生成连接脚本所需的服务器侧信息（给另一台电脑用）。
 // AuthorizedKeysPath 指向专供 sshd AuthorizedKeysCommand 读取的文件。
 type TunnelShareConfig struct {
 	SSHHost            string
@@ -36,7 +36,7 @@ func tunnelKeyMarker(id string) string { return "wb2api-share-" + id }
 
 func (p *Panel) keyShare(w http.ResponseWriter, r *http.Request) {
 	if !p.cfg.TunnelShare.enabled() {
-		writeErr(w, http.StatusNotImplemented, "分享连接尚未在服务器启用")
+		writeErr(w, http.StatusNotImplemented, "连接脚本尚未在服务器启用")
 		return
 	}
 	v, err := p.loadKeys(w)
@@ -45,7 +45,7 @@ func (p *Panel) keyShare(w http.ResponseWriter, r *http.Request) {
 	}
 	id := r.PathValue("id")
 	if v.Owner != "" && keyID(v.Owner) == id {
-		writeErr(w, http.StatusBadRequest, "默认密钥不能分享：请先为朋友创建独立密钥")
+		writeErr(w, http.StatusBadRequest, "默认密钥不能生成连接脚本：请先新建一把独立密钥")
 		return
 	}
 	apiKey := ""
@@ -204,9 +204,9 @@ $sshLogPath = $stem + '.ssh.log'
 $sshProcess = $null
 function Get-SSHFailure([string]$path) {
   $detail = if (Test-Path -LiteralPath $path) { (Get-Content -LiteralPath $path -Raw).Trim() } else { '' }
-  if ($detail -match 'Permission denied \(publickey\)') { return '连接密钥已失效。请删除旧脚本，并从面板重新下载最新分享脚本。' }
+  if ($detail -match 'Permission denied \(publickey\)') { return '连接密钥已失效。请删除旧脚本，并从面板重新下载最新连接脚本。' }
   if ($detail -match 'UNPROTECTED PRIVATE KEY FILE|bad permissions|Load key.*Permission denied') { return '临时 SSH 密钥权限不符合要求，请尝试以管理员身份运行。' }
-  if ($detail -match 'REMOTE HOST IDENTIFICATION HAS CHANGED|Host key verification failed') { return '服务器身份校验失败，请联系分享者重新生成连接脚本。' }
+  if ($detail -match 'REMOTE HOST IDENTIFICATION HAS CHANGED|Host key verification failed') { return '服务器身份校验失败，请回到面板重新生成连接脚本。' }
   if ($detail -match 'Connection timed out|Connection refused|Connection reset|Could not resolve hostname|No route to host') { return '无法连接服务器，请检查网络、防火墙或加速器设置。' }
   if ($detail -match 'Address already in use|cannot listen to port') { return "本机端口 $port 已被占用，请先关闭已有的 WorkBuddy2API 连接后重试。" }
   if ($detail) { return 'SSH 隧道启动失败：' + $detail }

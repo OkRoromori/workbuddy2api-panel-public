@@ -30,7 +30,7 @@ type Config struct {
 	APIKeyName string `json:"api_key_name"`
 	// APIKeys 额外密钥 → 名字，**只用于 /v1 转发**，不能登录面板。
 	//
-	// 为什么面板不放行：面板能改配置、删账号、看全部日志。给朋友一把只能转发、
+	// 为什么面板不放行：面板能改配置、删账号、看全部日志。给另一台电脑一把只能转发、
 	// 进不了后台的钥匙，是"共用网关"与"共用后台"之间的安全边界。
 	APIKeys map[string]string `json:"api_keys"`
 	// APIKeyPolicies 按密钥指纹保存额外密钥的模型白名单与并发限制。

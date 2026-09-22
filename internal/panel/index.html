@@ -1976,7 +1976,7 @@ select.mini {
         <div class="pad" style="padding-bottom:2px">
           <div class="hint" style="font-size:12.5px;color:var(--ink-3);line-height:1.7">
             给别人用的密钥在这里管理：他们只能调用 <b>/v1</b> 接口，<b>进不了这个面板</b>。
-            “编辑”可限制模型和这把密钥自己的并发数；“分享”会下载一个双击即连的脚本。
+            “编辑”可限制模型和这把密钥自己的并发数；“连接脚本”会下载一个双击即连的脚本——**给另一台电脑用，不必在每台电脑都部署**。
             「最近 7 天」那列来自「请求审计」——<span class="warn-note"><b>删之前先看一眼还有没有人在用</b></span>。
           </div>
         </div>
@@ -2256,7 +2256,7 @@ select.mini {
     <footer>
       <span class="grow"></span>
       <button class="ghost" id="btnKeyCancel">取消</button>
-      <button id="btnKeyShare" hidden>下载分享脚本</button>
+      <button id="btnKeyShare" hidden>下载连接脚本</button>
       <button class="primary" id="btnKeySubmit">生成</button>
     </footer>
   </div>

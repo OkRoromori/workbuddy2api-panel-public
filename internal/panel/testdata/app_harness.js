@@ -1289,8 +1289,8 @@ eq(fetched.length, 2, '仪表盘一轮轮询恰好 2 个请求');
 console.log('usageLog');
 const urows = [
   { ts: '2026-09-14T16:02:11+08:00', user: '我', model: 'glm-5.3', account: 'cb1a8f38', status: 200, mode: 'stream', has_usage: true, prompt: 470767, completion: 1070, cached: 455000, credit: 0.71, ttfb_ms: 3607, total_ms: 8560, client: 'curl/8.5.0' },
-  { ts: '2026-09-14T16:01:03+08:00', user: '朋友', model: 'hy3', account: '4863bb32', status: 200, mode: 'stream', has_usage: true, prompt: 488, completion: 8, cached: 0, credit: 0, ttfb_ms: 1200, total_ms: 2100, client: 'OpenAI/Python 1.30' },
-  { ts: '2026-09-14T16:00:00+08:00', user: '朋友', model: 'hy3', account: '', status: 429, mode: 'stream', has_usage: false, total_ms: 150, client: '' },
+  { ts: '2026-09-14T16:01:03+08:00', user: '第二台设备', model: 'hy3', account: '4863bb32', status: 200, mode: 'stream', has_usage: true, prompt: 488, completion: 8, cached: 0, credit: 0, ttfb_ms: 1200, total_ms: 2100, client: 'OpenAI/Python 1.30' },
+  { ts: '2026-09-14T16:00:00+08:00', user: '第二台设备', model: 'hy3', account: '', status: 429, mode: 'stream', has_usage: false, total_ms: 150, client: '' },
   { ts: '2026-09-14T15:59:00+08:00', user: '我', model: 'glm-5.3', account: 'cb1a8f38', status: 200, mode: 'sync', has_usage: true, prompt: 100, completion: 5, cached: 80, credit: 0.02, total_ms: 41000, client: '' },
   { ts: '2026-09-14T15:58:00+08:00', user: '我', model: 'glm-5.3', account: 'cb1a8f38', status: 200, mode: 'stream', has_usage: false, total_ms: 900, client: '' },
 ];
@@ -1298,7 +1298,7 @@ T.setUseData({
   date: '2026-09-14', days: ['2026-09-14', '2026-09-13'], retention: 7,
   truncated: false, dropped: 0, write_errors: 0,
   summary: { requests: 5, ok: 4, failed: 1 },
-  users: [{ name: '我', requests: 3 }, { name: '朋友', requests: 2 }],
+  users: [{ name: '我', requests: 3 }, { name: '第二台设备', requests: 2 }],
   models: [{ name: 'glm-5.3', requests: 3 }, { name: 'hy3', requests: 2 }],
   rows: urows,
 });
@@ -1316,7 +1316,7 @@ eq(T.useSlow({ ttfb_ms: 10000 }), true, '首字 10s 算慢');
 eq(T.useSlow({ total_ms: 30000 }), true, '总耗时 30s 算慢');
 
 eq(T.useRows().length, 5, '无筛选时全部返回');
-T.setUseUser('朋友'); eq(T.useRows().length, 2, '按用户筛选——这就是"区分你和你朋友"');
+T.setUseUser('第二台设备'); eq(T.useRows().length, 2, '按用户筛选——这就是"区分你和你第二台设备"');
 T.setUseUser(''); T.setUseModel('glm-5.3'); eq(T.useRows().length, 3, '按模型筛选');
 T.setUseModel('');
 // 状态按 HTTP 段分档（与参考设计同口径）。夹具里那条 429 属于 4xx。
@@ -1359,7 +1359,7 @@ T.setUseUser(''); T.setUseStatus('all'); T.setUseQuery('');
 T.renderUsage();
 const ubody = getEl('useBody').innerHTML;
 eq((ubody.match(/<tr/g) || []).length, 5, '渲染 5 条明细');
-ok(ubody.includes('朋友'), '明细里能看到用户');
+ok(ubody.includes('第二台设备'), '明细里能看到用户');
 // 四格 KPI + token 细条（取代原来的六张汇总卡）
 ok(getEl('useKpi').innerHTML.includes('0.73'), 'KPI 显示消耗积分');
 ok(getEl('useTokStrip').innerHTML.includes('455,080'), 'token 细条显示缓存命中量');
@@ -1444,7 +1444,7 @@ const csv = T.useCSV(urows);
 eq(csv.charCodeAt(0), 0xFEFF, 'CSV 带 UTF-8 BOM——否则 Excel 打开中文是乱码');
 ok(csv.indexOf('消耗积分') > 0, 'CSV 表头含积分列');
 eq(csv.trim().split('\r\n').length, 6, 'CSV = 表头 + 5 行');
-T.setUseUser('朋友');
+T.setUseUser('第二台设备');
 eq(T.useCSV(T.useRows()).trim().split('\r\n').length, 3, 'CSV 只导出当前筛选后的记录');
 T.setUseUser('');
 

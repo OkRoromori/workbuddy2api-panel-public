@@ -259,7 +259,7 @@ func TestSummarize(t *testing.T) {
 		{User: "我", Model: "a", Status: 200, HasUsage: true, Prompt: 100, Completion: 10, Cached: 80, TTFBMs: 1000, TotalMs: 2000},
 		{User: "我", Model: "a", Status: 200, HasUsage: true, Prompt: 200, Completion: 20, TTFBMs: 3000, TotalMs: 4000},
 		{User: "我", Model: "b", Status: 200, HasUsage: false},                        // 200 但缺 usage
-		{User: "朋友", Model: "b", Status: 503, TotalMs: 50},                           // 失败
+		{User: "第二台设备", Model: "b", Status: 503, TotalMs: 50},                        // 失败
 		{User: "", Model: "", Status: 200, HasUsage: true, Prompt: 1, Completion: 1}, // 老流水无 user/model
 	}
 	sum, byUser, byModel := Summarize(recs)
@@ -297,7 +297,7 @@ func TestSummarize(t *testing.T) {
 	for _, b := range byUser {
 		names[b.Name] = true
 	}
-	if !names["默认"] || !names["朋友"] {
+	if !names["默认"] || !names["第二台设备"] {
 		t.Errorf("空用户名应回落「默认」，实际桶名 %v", names)
 	}
 

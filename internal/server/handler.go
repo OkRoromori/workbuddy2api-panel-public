@@ -262,8 +262,8 @@ func (h *Handler) withAuth(next http.HandlerFunc) http.HandlerFunc {
 
 // withOwnerAuth 主密钥鉴权（/status 等管理端点）：只认 owner 密钥。
 //
-// 与 withAuth 的区别：withAuth 放行任意子密钥（朋友用），withOwnerAuth 只放行
-// 主密钥——/status 暴露账号池细节，不该给朋友看。
+// 与 withAuth 的区别：withAuth 放行任意子密钥，withOwnerAuth 只放行主密钥——
+// /status 暴露账号池细节，不该给子密钥看。
 func (h *Handler) withOwnerAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if !httpauth.VerifyBearer(r, h.loadLive().APIKey) {

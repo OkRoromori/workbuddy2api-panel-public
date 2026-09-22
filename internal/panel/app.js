@@ -3140,7 +3140,7 @@ function useHasAnyFilter() {
   return useActiveFilters().length > 0 || useQuery.trim() !== '';
 }
 
-// useAgg 在筛选后的明细上算汇总。KPI 跟着筛选走（"朋友今天花了多少"就是这个数），
+// useAgg 在筛选后的明细上算汇总。KPI 跟着筛选走（"另一台电脑今天花了多少"就是这个数），
 // 而筛选菜单里的计数是全天的——两者口径不同，所以页头会标明当前筛选状态。
 function useAgg(rows) {
   const a = { n: rows.length, ok: 0, fail: 0, miss: 0, credit: 0,
@@ -3561,7 +3561,7 @@ $('btnUseCsv').onclick = () => {
 let keysData = null;
 let keysRealm = null;     // keysData 属于哪个域（「最近 7 天」用量列是服务端按域算的）
 let keyDlgMode = 'new'; // 'new' | 'edit' | 'done'
-let keyDlgID = '';      // edit/分享/删除 的目标 id
+let keyDlgID = '';      // edit/连接脚本/删除 的目标 id
 let keyDlgKey = '';     // done 态要复制的完整密钥
 let keyDlgBusy = false;
 let keyScope = 'all';   // all | selected
@@ -3601,7 +3601,7 @@ function keyRowHTML(k) {
     ? '<span style="color:var(--ink-3);font-size:12px">在「设置」里改</span>'
     : '<div class="btn-row">' +
       '<button type="button" class="xs" data-act="copy" data-id="' + esc(k.id) + '">复制</button>' +
-      '<button type="button" class="xs primary" data-act="share" data-id="' + esc(k.id) + '">分享</button>' +
+      '<button type="button" class="xs primary" data-act="share" data-id="' + esc(k.id) + '">连接脚本</button>' +
       '<button type="button" class="xs" data-act="edit" data-id="' + esc(k.id) + '">编辑</button>' +
       '<button type="button" class="xs danger" data-act="del" data-id="' + esc(k.id) + '">删除</button>' +
       '</div>';
@@ -3655,11 +3655,11 @@ async function downloadKeyShare(k) {
     const url = URL.createObjectURL(await r.blob());
     const a = document.createElement('a');
     a.href = url;
-    a.download = 'WorkBuddy-' + (k.name || 'friend').replace(/[\\/:*?"<>|]/g, '_') + '-连接.bat';
+    a.download = 'WorkBuddy-' + (k.name || 'device').replace(/[\\/:*?"<>|]/g, '_') + '-连接.bat';
     document.body.appendChild(a);
     a.click(); a.remove();
     setTimeout(() => URL.revokeObjectURL(url), 4000);
-    toast('分享脚本已下载；重新下载会让旧脚本失效', 'ok');
+    toast('连接脚本已下载（拷到另一台电脑双击即用）；重新下载会让旧脚本失效', 'ok');
   } catch (e) { toast('下载失败：' + e.message, 'err'); }
 }
 
@@ -3847,7 +3847,7 @@ $('btnKeysRefresh').onclick = loadKeys;
 $('btnKeyCancel').onclick = closeKeyDlg;
 $('btnKeyShare').onclick = () => {
   const k = keysData && (keysData.keys || []).filter(x => x.id === keyDlgID)[0];
-  downloadKeyShare(k || { id: keyDlgID, name: $('keyNameInput').value.trim() || 'friend' });
+  downloadKeyShare(k || { id: keyDlgID, name: $('keyNameInput').value.trim() || 'device' });
 };
 $('keyNameInput').addEventListener('keydown', ev => {
   if (ev.key === 'Enter') { ev.preventDefault(); $('btnKeySubmit').click(); }

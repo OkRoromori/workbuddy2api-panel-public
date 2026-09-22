@@ -88,7 +88,7 @@ type Config struct {
 	// LogsPath 运行日志环形缓冲落盘路径（data/logs.json）。空 = 不落盘。
 	LogsPath string
 
-	// TunnelShare 开启"下载朋友连接脚本"。为空时分享接口返回 501。
+	// TunnelShare 开启"下载连接脚本"（给另一台电脑用，免重复部署）。为空时该接口返回 501。
 	TunnelShare TunnelShareConfig
 
 	// Usage 逐请求用量记录器（nil = 用量接口返回 501）。

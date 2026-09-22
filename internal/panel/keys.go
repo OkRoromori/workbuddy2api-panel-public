@@ -260,7 +260,7 @@ func (p *Panel) keyDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := p.revokeTunnelKey(id); err != nil {
-		writeErr(w, http.StatusInternalServerError, "密钥已删除，但撤销分享隧道失败："+err.Error())
+		writeErr(w, http.StatusInternalServerError, "密钥已删除，但撤销连接脚本的隧道失败："+err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
