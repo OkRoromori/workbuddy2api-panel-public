@@ -125,7 +125,7 @@ This branch is based on ②'s `v1.11.0-panel` (`b4245a8`, 2026-09-19) and **has 
 | ②'s commit | Content | Status here |
 |---|---|---|
 | `08752df` (09-20) | `fix(panel)`: the run queue now merges mp-scope to-dos — fixes "the scan shows to-dos but the queue says there is nothing to run" | **Absorbed.** Both the scan and the queue now share one `mergeMPPending` implementation instead of each carrying its own copy, with a regression test in `internal/panel/taskcenter_test.go`: removing the call reproduces the original symptom ("no runnable to-dos, all accounts done") |
-| `b69d06e` (09-20) | Version bump to 1.11.1-panel | Followed: `appVersion = "1.11.1-panel"` (meaning ②'s 1.11.1 fixes are all in; this branch's own additions are not reflected in that number) |
+| `b69d06e` (09-20) | Version bump to 1.11.1-panel | Followed: `appVersion = "1.11.1-panel-main"` — the numeric part means ②'s 1.11.1 fixes are all in, and the `-main` suffix marks this branch's line (it is what the panel title shows, so you can tell at a glance which build is running) |
 
 > Note: in a few places this branch implements things **differently** from ② (e.g. body size: ② removed the pre-check and lets the upstream respond naturally, while this branch reads the body whole with an explicit 64 MiB 413; model names: ② returns prefixes, this branch returns bare names). Those are forks, not lag — see the individual rows above.
 

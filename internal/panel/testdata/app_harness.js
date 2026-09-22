@@ -1237,7 +1237,7 @@ sandbox.fetch = (url, opts) => {
 T.applyStatus(overviewPayload);
 eq(getEl('navState').textContent, '无可用账号', 'navState：有账号但无可用');
 eq(getEl('navVer').textContent, 'v9.9.9', 'navVer 版本');
-eq(getEl('navSub').textContent, 'v9.9.9', 'navSub 版本');
+eq(getEl('navSub').textContent, '非官方控制台', 'navSub 显示「非官方控制台」（版本号在大字标题与左下角）');
 eq(getEl('navRedis').textContent, 'Redis 镜像', 'navRedis 认 upstash');
 ok(getEl('navPulse').className.includes('warn'), '有账号但全不可用 → pulse warn');
 eq(getEl('subMeta').textContent, '运行 1 天 1 时 1 分', 'subMeta 运行时长');

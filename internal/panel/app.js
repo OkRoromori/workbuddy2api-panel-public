@@ -19,11 +19,16 @@ const POLL_MS = 5000;
 //（在文档里提一句属于指称性使用，没问题；占品牌位就不一样了）。
 // 用版本标识当标题的额外好处：打开面板就知道服务器跑的是哪一版。
 const APP_NAME = 'v1.11.1-panel-main';
+// APP_SUB 侧边栏小字。写「非官方控制台」而不是再写一遍版本号——上下两行同一个
+// 字符串看着像 bug；版本号在大字标题与左下角（v… · 本地内存）都看得到。
+const APP_SUB = '非官方控制台';
 // applyAppName 把显示名写进侧边栏与浏览器标签（index.html 里留的是同样的文本，
 // 无 JS 时也能看到，不至于空白）。
 function applyAppName() {
   const el = $('brandName');
   if (el) el.textContent = APP_NAME;
+  const sub = $('navSub');
+  if (sub) sub.textContent = APP_SUB;
   if (document.title !== undefined) document.title = APP_NAME + ' · 非官方控制台';
 }
 // 任务队列的轮询定时器与代次。**必须在这里声明**：applyCnOnlyViews() 在模块顶层
@@ -1992,7 +1997,7 @@ function applyStatus(d) {
       : '';
     who.title = busy.length ? busy.map(s => s.uid).join('\n') : '';
   }
-  $('navSub').textContent = 'v' + d.version;
+  $('navSub').textContent = APP_SUB;   // 小字固定写「非官方控制台」，别再写版本号（见 APP_SUB 注释）
   $('navVer').textContent = 'v' + d.version;
   $('navRedis').textContent = d.redis_mode === 'upstash' ? 'Redis 镜像' : '本地内存';
   $('navState').textContent = d.healthy > 0 ? '服务正常' : (d.total ? '无可用账号' : '待添加账号');
