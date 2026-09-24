@@ -719,3 +719,42 @@ func TestLoadConfigPathIsDirectory(t *testing.T) {
 		t.Errorf("error should suggest the fix (cp config.example.json): %v", err)
 	}
 }
+
+// TestNormalizePinsDropsNullAndInvalid 钉住 pins 清理的三条规则：
+//   - null 值（API 语义里表示"删除该 pin"）不许留在表里成为垃圾键
+//   - 非法域值丢弃
+//   - 清完为空 → 整个 pins 归 nil（配置文件里不出现空对象）
+//
+// 背景：面板/脚本删除单个 pin 的提交形态是 {"pins":{"模型名":null}}，深合并后
+// null 会作为键值对留在 map 里；此前 len>0 才重建，垃圾键永远清不掉。
+func TestNormalizePinsDropsNullAndInvalid(t *testing.T) {
+	base := func(pins string) *Config {
+		raw := []byte(`{"model_realm":{"prefer":"cn","pins":` + pins + `}}`)
+		c, err := ParseConfig(raw)
+		if err != nil {
+			t.Fatalf("ParseConfig: %v", err)
+		}
+		return c
+	}
+
+	// null 值被清掉
+	c := base(`{"deepseek-v4.1-flash":null,"glm-5.2":"cn"}`)
+	if _, ok := c.ModelRealm.Pins["deepseek-v4.1-flash"]; ok {
+		t.Errorf("null pin 应被清除，实际 pins=%v", c.ModelRealm.Pins)
+	}
+	if c.ModelRealm.Pins["glm-5.2"] != "cn" {
+		t.Errorf("合法 pin 应保留，实际 pins=%v", c.ModelRealm.Pins)
+	}
+
+	// 全部为 null → pins 归 nil（不剩空对象）
+	c = base(`{"deepseek-v4.1-flash":null}`)
+	if c.ModelRealm.Pins != nil {
+		t.Errorf("清空后应归 nil（不出现在配置文件里），实际 %v", c.ModelRealm.Pins)
+	}
+
+	// 非法域值丢弃、键去空白
+	c = base(`{" a ":"cn","b":"mars"}`)
+	if len(c.ModelRealm.Pins) != 1 || c.ModelRealm.Pins["a"] != "cn" {
+		t.Errorf("非法值应丢弃/键应去空白，实际 %v", c.ModelRealm.Pins)
+	}
+}

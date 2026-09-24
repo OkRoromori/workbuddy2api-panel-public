@@ -2711,10 +2711,20 @@ function logViewSig() {
   return logLines.length + '|' + (logLines[logLines.length - 1] || '') + '|' + logFilter + '|' + logQuery;
 }
 
-function paintLogs() {
+function paintLogs(force) {
   const box = $('logBox');
   if (!box || box.dataset.cleared === '1') return;
   viewSig.logs = logViewSig(); viewDirty.logs = false;
+  // 轮询场景下日志内容往往没变（服务安静时）——chips 与表体都跳过重建。
+  // 变了才全量重画（500 行 DOM 重建 + 每行多正则，是这页最大的渲染成本）。
+  const chipsKey = logLines.length + '|' + logFilter;
+  if (!force && chipsKey === paintLogs._chipsKey && paintLogs._body === viewSig.logs) {
+    const m0 = $('termMeta');
+    if (m0) m0.textContent = logLines.length + ' 行 · 自动刷新 ' + Math.round(POLL_MS / 1000) + 's';
+    return;
+  }
+  paintLogs._chipsKey = chipsKey;
+  paintLogs._body = viewSig.logs;
   renderLogChips(logLines);
   const vis = visibleLogs(logLines);
   box.innerHTML = vis.length
@@ -2768,7 +2778,24 @@ function acctCell(acct) {
 // 为什么兼容缩写：审计流水里存的 account 是 `uidPrefix()` 截过的前 8 位
 //（为了省磁盘），拿它去按完整 uid 查别名永远查不到。这是它唯一容易出错的地方，
 // 也是为什么要写成前缀匹配而不是等值匹配。
+// __uidMap uidName 的查询缓存：500 行日志 × 每行 1~2 次 uid 替换，原来是每次都
+// 对 23 个账号做线性 find（单次渲染 1 万+ 次字符串比较）。按 overviewData 引用失效。
+let __uidMapKey = null, __uidMap = null;
 function uidName(uid) {
+  const list = (overviewData && overviewData.accounts) || [];
+  if (__uidMapKey !== list) {
+    __uidMapKey = list;
+    __uidMap = new Map();
+    for (const a of list) {
+      if (a.uid) __uidMap.set(a.uid, a);
+      if (a.uid && a.uid.length >= 8) __uidMap.set(a.uid.slice(0, 8), a);
+    }
+  }
+  const hit = __uidMap.get(uid) || (uid && uid.length >= 8 ? __uidMap.get(uid.slice(0, 8)) : null);
+  if (!hit) return (uid || '').slice(0, 8);
+  return hit.alias || hit.nickname || hit.uid.slice(0, 8);
+}
+function uidNameSlow(uid) {
   const list = (overviewData && overviewData.accounts) || [];
   let a = list.find(x => x.uid === uid);
   if (!a && uid && uid.length >= 8) {

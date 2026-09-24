@@ -516,7 +516,10 @@ func (c *Config) normalize() error {
 	if c.ModelRealm.Prefer != "global" {
 		c.ModelRealm.Prefer = "cn"
 	}
-	if len(c.ModelRealm.Pins) > 0 {
+	// 无条件重建 pins：非法值丢弃、键去空白、null/空值（API 语义里表示"删除该 pin"）
+	// 也一并清掉——否则 JSON null 会留在表里成为垃圾键，且 len>0 的判断让空表永不清理。
+	// 重建后为空就置 nil，配置文件里不再出现空对象。
+	{
 		pins := make(map[string]string, len(c.ModelRealm.Pins))
 		for name, realm := range c.ModelRealm.Pins {
 			name = strings.TrimSpace(name)
@@ -525,7 +528,11 @@ func (c *Config) normalize() error {
 			}
 			pins[name] = realm
 		}
-		c.ModelRealm.Pins = pins
+		if len(pins) > 0 {
+			c.ModelRealm.Pins = pins
+		} else {
+			c.ModelRealm.Pins = nil
+		}
 	}
 	if !strings.HasPrefix(c.Listen, ":") && !strings.Contains(c.Listen, ":") {
 		c.Listen = ":" + c.Listen
