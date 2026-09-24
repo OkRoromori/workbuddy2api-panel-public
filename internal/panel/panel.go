@@ -130,6 +130,14 @@ type Panel struct {
 	// aliases 账号别名表（uid → 面板显示名）。纯展示层，与池/凭据解耦。
 	aliases *aliasStore
 
+	// 三个慢接口的结果缓存（swr.go）：数据变化频率远低于访问频率，每次点开都真打
+	// 一遍上游就是「面板卡」的主因（packages 实测 4 秒——23 个号逐个实时查上游）。
+	pkgCache    *swrCache            // 积分构成：逐账号实时查上游（TTL 60s + 后台刷新）
+	usageCache  *swrCache            // 请求审计：全量读当天 JSONL 再聚合（TTL 15s）
+	modelsCache *swrCache            // 模型目录：并发探两路上游（TTL 120s）
+	usageCaches map[string]*swrCache // 请求审计：按日期分桶（TTL 15s）
+	usageMu     sync.Mutex
+
 	// trendCache 「近 N 天用量趋势」的结果缓存（见 trend.go）。读写都持 trendCacheMu。
 	trendCacheMu   sync.Mutex
 	trendCacheData trendCacheVal
@@ -192,6 +200,7 @@ func New(cfg Config) *Panel {
 		logs:    NewRing(500),
 		logins:  map[string]loginSession{},
 	}
+	p.initSlowCaches()
 	p.routes()
 	return p
 }
@@ -204,7 +213,7 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/app.js", p.appScript)
 	p.mux.HandleFunc("GET /panel/api/overview", p.withAuth(p.overview))
 	p.mux.HandleFunc("GET /panel/api/logs", p.withAuth(p.logsHandler))
-	p.mux.HandleFunc("GET /panel/api/models", p.withAuth(p.models))
+	p.mux.HandleFunc("GET /panel/api/models", p.withAuth(p.modelsCached))
 	p.mux.HandleFunc("POST /panel/api/login/start", p.withAuth(p.loginStart))
 	p.mux.HandleFunc("GET /panel/api/login/poll", p.withAuth(p.loginPoll))
 	p.mux.HandleFunc("GET /panel/api/login/regions", p.withAuth(p.loginRegions))
@@ -233,7 +242,7 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("POST /panel/api/activity_all", p.withAuth(p.activityAll))
 	p.mux.HandleFunc("POST /panel/api/keepalive_all", p.withAuth(p.keepaliveAll))
 	p.mux.HandleFunc("POST /panel/api/balance_all", p.withAuth(p.balanceAll))
-	p.mux.HandleFunc("GET /panel/api/packages", p.withAuth(p.packages))
+	p.mux.HandleFunc("GET /panel/api/packages", p.withAuth(p.packagesCached))
 	p.mux.HandleFunc("GET /panel/api/usage", p.withAuth(p.usageDispatch))
 	p.mux.HandleFunc("POST /panel/api/usage/save", p.withAuth(p.usageSave))
 	p.mux.HandleFunc("GET /panel/api/model_probes", p.withAuth(p.modelProbes))
@@ -277,7 +286,7 @@ func (p *Panel) usageDispatch(w http.ResponseWriter, r *http.Request) {
 		p.usage(w, r)
 		return
 	}
-	p.usageDay(w, r)
+	p.usageCached(w, r)
 }
 
 // ServeHTTP 统一入口：先写安全响应头再分发，保证页面、静态资源、API

@@ -11,6 +11,9 @@ let view = 'accounts';
 let overviewData = null, cfgLoaded = null;
 let logPin = true, loginState = null, loginTimer = null;
 let refTimer = null;
+// lastDataTime 最近一次带 X-Data-Time 头的响应里的数据时间（ISO 字符串）。
+// 由 api() 统一捕获；dataTimeSuffix() 把它变成页脚后缀。
+let lastDataTime = '';
 // POLL_MS 面板轮询间隔（毫秒）。日志页脚要把它写出来，所以只此一处定义——
 // 以前页脚硬编码「自动刷新 1.5s」，而真实间隔是 5s，写的和做的不一致。
 const POLL_MS = 5000;
@@ -38,6 +41,13 @@ function applyAppName() {
 // 顶层引用 queueTimer，声明留在这一节会撞 TDZ）。
 
 const $ = id => document.getElementById(id);
+// dataTimeSuffix 页脚的「数据时间」后缀。没有就空串（接口没带缓存或首次同步拉取）。
+function dataTimeSuffix() {
+  if (!lastDataTime) return '';
+  const d = new Date(lastDataTime);
+  if (isNaN(d)) return '';
+  return ' · 数据 ' + String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0');
+}
 
 /* ── 主题 ─────────────────────────────────────────────────────────── */
 /* 两态翻转（浅/深），首次访问跟随系统偏好；点击总是切换可见外观，符合直觉。 */
@@ -248,6 +258,10 @@ async function api(path, opts = {}) {
   if (opts.body) h['Content-Type'] = 'application/json';
   const r = await fetch('/panel/api/' + path, Object.assign({}, opts, { headers: h }));
   if (r.status === 401) { openKey(); throw new Error('密钥无效或未填写'); }
+  // 慢接口带缓存（packages/usage/models），服务端用这个头说明「数据是什么时候取的」。
+  // 存全局一份，渲染函数据此在页脚显示「数据时间 HH:MM」——看到旧的不再是黑盒。
+  const dt = r.headers.get('X-Data-Time');
+  if (dt) lastDataTime = dt;
   const d = await r.json().catch(() => ({}));
   if (!r.ok) throw new Error(d.error || ('HTTP ' + r.status));
   return d;
@@ -2476,7 +2490,7 @@ async function loadModels() {
     // 筛选只是视图层过滤，不重新打上游。
     mdCache = all;
     renderIfChanged('models', mdViewSig(), renderModels);
-    $('mdNote').textContent = all.length + ' 个模型 · 已刷新降级缓存';
+    $('mdNote').textContent = all.length + ' 个模型 · 缓存 120s' + dataTimeSuffix();
   } catch (e) {
     tb.innerHTML = '<tr><td colspan="7"><div class="empty">' + esc(e.message) + '</div></td></tr>';
   }
@@ -3439,7 +3453,7 @@ function renderUsage() {
   if (useData.bad_lines) notes.push('有 ' + useData.bad_lines + ' 行读不出来（当天数据不完整）');
   $('useCount').textContent = notes.join(' · ');
   // 页头把"筛选了什么"写出来：KPI 跟着筛选走，不写清楚的话数字对不上全天会觉得是 bug。
-  $('useNote').textContent = '保留 ' + (useData.retention || 7) + ' 天 · ' + useDay +
+  $('useNote').textContent = '保留 ' + (useData.retention || 7) + ' 天 · ' + useDay + dataTimeSuffix() +
     (acts.length ? ' · ' + acts.join(' + ') : '');
 }
 
@@ -4988,7 +5002,7 @@ function renderPackages(d) {
       '</div>';
   }).join('');
 
-  $('pkNote').textContent = list.length + ' 个账号 · 实时查询上游';
+  $('pkNote').textContent = list.length + ' 个账号 · 缓存 60s' + dataTimeSuffix();
 
   // 逐包明细：每个账号一个表，包的**面额**列是重点
   $('pkDetail').innerHTML = list.map(a => {

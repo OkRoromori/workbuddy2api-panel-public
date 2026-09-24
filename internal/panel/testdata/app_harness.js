@@ -1230,7 +1230,8 @@ sandbox.fetch = (url, opts) => {
   if (u.endsWith('/login/start')) body = { ok: true, url: 'https://example.test/auth?state=s1', state: 's1', realm: 'cn' };
   // poll 的 URL 带 ?state=…，所以用 includes 而不是 endsWith（endsWith 匹配不上）。
   if (u.includes('/login/poll')) body = { done: true, uid: 'u9', nickname: '新号', realm: 'global', credits: 100, credits_total: 500 };
-  return Promise.resolve({ status: 200, ok: true, json: () => Promise.resolve(body) });
+  return Promise.resolve({ status: 200, ok: true, json: () => Promise.resolve(body),
+    headers: { get: () => null } });   // api() 会读 X-Data-Time；桩没有缓存头，返回 null 即可
 };
 
 // applyStatus：这是侧边栏 / 顶栏 / 计数卡的唯一更新入口
