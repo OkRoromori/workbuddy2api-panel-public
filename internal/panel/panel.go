@@ -583,7 +583,14 @@ func (p *Panel) accountCheckin(w http.ResponseWriter, r *http.Request) {
 	}
 	checkinMsg := ""
 	if err := p.cfg.Upstream.DailyCheckin(a); err != nil {
-		checkinMsg = err.Error() // "今天已签到"等业务错误照常查余额
+		// 「今天已签到」是幂等成功而不是错误：给一句人话（toast 会原样展示这个字段），
+		// 不把上游 400 的原始 JSON（含 requestId 整段）糊到用户脸上。其它错误仍透原样——
+		// 那些需要完整信息排查。
+		if upstream.IsAlreadyCheckin(err) {
+			checkinMsg = "今天已签到（重复签到，明天再来）"
+		} else {
+			checkinMsg = err.Error()
+		}
 	}
 	resp := map[string]any{"ok": true}
 	if checkinMsg != "" {

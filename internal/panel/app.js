@@ -2276,7 +2276,12 @@ $('ckBody').addEventListener('click', async ev => {
   try {
     if (a === 'checkin') {
       const r = await api('accounts/' + encodeURIComponent(u) + '/checkin', { method: 'POST' });
-      toast('签到完成' + (r.credits != null ? '，积分 ' + r.credits : '') + (r.checkin_message ? '（' + r.checkin_message + '）' : ''), 'ok');
+      // 幂等（今天已签过）单独说，别跟「签到完成」拼在一起造成误读
+      if (r.checkin_message && r.checkin_message.includes('已签到')) {
+        toast('这个号今天已经签到过了（不用重复签）', 'ok');
+      } else {
+        toast('签到完成' + (r.credits != null ? '，积分 ' + r.credits : '') + (r.checkin_message ? '（' + r.checkin_message + '）' : ''), 'ok');
+      }
     }
   } catch (e) { toast(e.message, 'err'); }
   finally { b.disabled = false; loadOverview(true); }
