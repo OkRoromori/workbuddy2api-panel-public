@@ -77,9 +77,13 @@ type Status struct {
 	RateLimitedModels []RateLimitedModel `json:"rate_limited_models,omitempty"`
 	// Realm 账号域（cn/global，auth.Realm() 计算值；含 global.enabled 开关闸）。
 	// 供面板/状态接口按域分组展示。
-	Realm           string     `json:"realm,omitempty"`
-	Disabled        bool       `json:"disabled"`
-	DisabledReason  string     `json:"disabled_reason,omitempty"` // 仅 disabled 账号：禁用原因（运维可见）
+	Realm          string `json:"realm,omitempty"`
+	Disabled       bool   `json:"disabled"`
+	DisabledReason string `json:"disabled_reason,omitempty"` // 仅 disabled 账号：禁用原因（运维可见）
+	// TodayChecked / LastCheckin 签到状态（由 CheckinAt 派生，见 statusOf）。修复
+	// 面板「任务管理」页字段断裂：此前恒显示「未签 · 0」。
+	TodayChecked    bool       `json:"today_checked"`
+	LastCheckin     time.Time  `json:"last_checkin,omitempty"`
 	SuccessCount    int64      `json:"success_count,omitempty"`
 	ErrTotal        int64      `json:"err_total,omitempty"`
 	LastSuccessTime time.Time  `json:"last_success,omitempty"`
@@ -180,6 +184,11 @@ type entry struct {
 	disabled        bool
 	reason          string
 	lastUsed        time.Time // 最近被选中时刻（防并发撞号）
+	// checkinAt 最近一次签到动作确认时刻（成功或幂等）。运行态不持久化：重启后
+	// 当天首次签到会真实打上游（幂等也算确认），日期切天后第一次查询即自然归位。
+	// 面板任务管理页的「已签/未签」标签由此派生——此前该字段断裂（前端读
+	// today_checked，后端从未输出），所有号恒显示「未签 · 0」。
+	checkinAt time.Time
 	// usedSeq 单调递增的选中序号：每次被 pick 选中时取 p.pickSeq 自增值。
 	// Windows 等平台 time.Now() 精度有限（~0.5ms），高并发/快速连续选号时多个
 	// 账号 lastUsed 完全相等，基于 wall-clock 的 LRU/防惊群判定失效。

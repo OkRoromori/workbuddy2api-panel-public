@@ -589,7 +589,7 @@ const ckPool = [
 T.renderCheckin(ckPool);
 eq(getEl('ckSigned').textContent, '1 / 2', '今日已签 1/2');
 eq(getEl('ckPending').textContent, 1, '未签 1');
-eq(getEl('ckTodaySum').textContent, '+100', '今日积分合计');
+eq(getEl('ckTodaySum').textContent, '1 个已签', '今日已签数（积分无独立累计口径，假 0 已除）');
 eq((getEl('ckBody').innerHTML.match(/<td\b/g) || []).length / 2, 8, '签到行 8 列');
 ok(getEl('ckBody').innerHTML.includes('已签'), '已签胶囊在位');
 ok(getEl('ckBody').innerHTML.includes('data-a="checkin"'), '签到按钮在签到页');

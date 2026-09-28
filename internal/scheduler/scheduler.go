@@ -412,11 +412,14 @@ func (s *Scheduler) RunCheckinNow() {
 		if err := s.cfg.Upstream.DailyCheckin(a); err != nil {
 			// "今天已签到"是幂等成功（上游对重复签到返回 code!=0），不再当失败打 error 行。
 			if upstream.IsAlreadyCheckin(err) {
+				s.cfg.Pool.NoteCheckin(st.UID) // 打点：任务管理页的「已签」标签由此派生
 				log.Printf("checkin %s: 今天已签到（幂等）", logfmt.Label(st.UID, st.Nickname))
 			} else {
 				log.Printf("checkin %s: %v", logfmt.Label(st.UID, st.Nickname), err)
 			}
 			// 其余业务错误也继续走余额查询
+		} else {
+			s.cfg.Pool.NoteCheckin(st.UID) // 真实成功也打点
 		}
 		// 分桶查余额：快过期窗口内的积分单独标记，pool 优先消耗。
 		// ExpiringSoonWindow<=0 时退化为纯总量（与引入前一致）。

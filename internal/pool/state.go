@@ -489,6 +489,8 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		ProbeOK:           e.probeOK,
 		ProbeErr:          e.probeErr,
 		ProbeFails:        e.probeFails,
+		TodayChecked:      sameLocalDay(e.checkinAt, now),
+		LastCheckin:       e.checkinAt,
 	}
 	if st.Disabled {
 		// 禁用账号透出禁用原因（运维看不到为什么死）。
@@ -503,6 +505,27 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		st.CoolKind = e.coolKind.String()
 	}
 	return st
+}
+
+// sameLocalDay 两时刻是否同一个本地日（签到状态按本地日历日归位，与上游的
+// 「今天已签到」语义一致——上游按北京日历日重置）。
+func sameLocalDay(a, b time.Time) bool {
+	if a.IsZero() {
+		return false
+	}
+	ay, am, ad := a.Local().Date()
+	by, bm, bd := b.Local().Date()
+	return ay == by && am == bm && ad == bd
+}
+
+// NoteCheckin 记录一次签到确认（成功或幂等都算）。供 scheduler 与面板单号签到
+// 调用；消费方是 statusOf 的 TodayChecked/LastCheckin 派生。
+func (p *Pool) NoteCheckin(uid string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if e, ok := p.byUID[uid]; ok {
+		e.checkinAt = time.Now()
+	}
 }
 
 // modelCostsStatusLocked 收集账号的有效成本台账行（P1-anti-monopoly 可观测性）。

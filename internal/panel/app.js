@@ -2095,12 +2095,12 @@ function renderCheckin(list) {
   if (!tb) return;
   const signed = ckList.filter(s => s.today_checked).length;
   const pending = ckList.length - signed;
-  const todaySum = ckList.reduce((a, s) => a + (s.today_credit || 0), 0);
-  const monthSum = ckList.reduce((a, s) => a + (s.month_credit || 0), 0);
   if ($('ckSigned')) $('ckSigned').textContent = signed + ' / ' + ckList.length;
   if ($('ckPending')) $('ckPending').textContent = pending;
-  if ($('ckTodaySum')) $('ckTodaySum').textContent = todaySum ? '+' + todaySum : '0';
-  if ($('ckMonthSum')) $('ckMonthSum').textContent = monthSum;
+  // 今日/本月签到积分上游没有累计口径（签到奖励直接进积分包），KPI 卡改显
+  // 「今日已签 N 个」，不再显示恒为 0 的假数字（字段断裂时期的遗留）。
+  if ($('ckTodaySum')) $('ckTodaySum').textContent = signed ? (signed + ' 个已签') : '0';
+  if ($('ckMonthSum')) $('ckMonthSum').textContent = '';
   renderCkChips(ckList);
   if (!ckList.length) {
     if ($('ckCount')) $('ckCount').textContent = '';
@@ -2117,13 +2117,15 @@ function renderCheckin(list) {
     const tag = s.today_checked
       ? '<span class="tag ok">已签</span>'
       : '<span class="tag mute">未签</span>';
-    const today = s.today_checked ? ('+' + (s.today_credit || 0)) : '—';
+    // 签到积分没有独立累计口径；这两列显示「最近签到」的日期与时间（真实数据）。
+    const lastCk = s.last_checkin && s.last_checkin !== '0001-01-01T00:00:00Z'
+      ? String(s.last_checkin).slice(5, 16).replace('T', ' ') : '—';
     return '<tr>' +
       accNameCell(s) +
       '<td><span class="tag mute">API</span></td>' +
       '<td>' + tag + '</td>' +
-      '<td class="num">' + today + '</td>' +
-      '<td class="num">' + (s.month_credit || 0) + '</td>' +
+      '<td class="num">' + lastCk + '</td>' +
+      '<td class="num" style="color:var(--ink-3)">进包</td>' +
       '<td class="num">' + (s.credits == null ? '—' : s.credits) + '</td>' +
       '<td class="num" style="color:var(--ink-3)">' + ymd(s.last_checkin) + '</td>' +
       '<td class="acts"><div class="btn-row">' +

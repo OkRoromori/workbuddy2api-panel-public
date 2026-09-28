@@ -582,6 +582,7 @@ func (p *Panel) accountCheckin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	checkinMsg := ""
+	defer func() { p.cfg.Pool.NoteCheckin(uid) }() // 幂等/成功都确认（今天已签状态供任务管理页派生）
 	if err := p.cfg.Upstream.DailyCheckin(a); err != nil {
 		// 「今天已签到」是幂等成功而不是错误：给一句人话（toast 会原样展示这个字段），
 		// 不把上游 400 的原始 JSON（含 requestId 整段）糊到用户脸上。其它错误仍透原样——
