@@ -237,7 +237,7 @@ const trailer = `
   openExpiryDetail, _closeExpiryDetail,
   // 使用日志（请求审计流水）
   useRows, useAgg, useRowHTML, useCSV, fmtCredit, useSlow, useUserName, useModelName,
-  renderUsage,
+  renderUsage, useNewRowsPrefix,
   setTrendDays: v => { trendData = { days: v }; },
   setDailyNet: v => { _lastDailyNet = v; },
   renderCreditBurn,
@@ -1448,6 +1448,49 @@ eq(csv.trim().split('\r\n').length, 6, 'CSV = 表头 + 5 行');
 T.setUseUser('第二台设备');
 eq(T.useCSV(T.useRows()).trim().split('\r\n').length, 3, 'CSV 只导出当前筛选后的记录');
 T.setUseUser('');
+
+/* ── 请求审计：明细渲染窗口 + 密钥筛选合并 ─────────────────────────
+   背景：单日明细最多 2000 行，全量塞进 DOM 是 ~9 万节点，线上实测整表重画
+   74–127ms 且轮询每来新请求就重画一次（"请求审计特别卡"的根因）。现在只渲染
+   最近 300 行 + 页脚；筛选/搜索/CSV 仍基于全量。 */
+console.log('usageWindow');
+const manyRows = [];
+for (let i = 0; i < 400; i++) {
+  manyRows.push({ ts: '2026-09-14T10:00:' + String(i % 60).padStart(2, '0') + '+08:00',
+    user: '我', model: 'glm-5.3', account: 'cb1a8f38', status: 200, mode: 'stream',
+    has_usage: true, prompt: 10, completion: 2, total_ms: 100 });
+}
+T.setUseData({ date: '2026-09-14', days: ['2026-09-14'], retention: 7,
+  summary: { requests: 400 }, users: [], models: [], rows: manyRows });
+T.renderUsage();
+const ub = getEl('useBody').innerHTML;
+eq((ub.match(/<tr/g) || []).length, 301, '窗口渲染 300 行 + 1 行页脚');
+ok(ub.includes('还有 100 条未显示'), '页脚写清未显示条数');
+ok(ub.includes('id="useMore"'), '页脚带「显示更多」按钮');
+ok(getEl('useCount').textContent.includes('表格显示最近 300 条'), '页头注明窗口口径');
+eq(T.useRows().length, 400, '筛选/导出仍基于全量 400 条（不受窗口限制）');
+
+// 增量前缀判定（纯函数）：轮询常态 = 顶部插进来 k 条、其余原样 → 返回 k；
+// 无净新增或顺序被改 → -1（回落整窗重画）。
+const prevRows = [
+  { ts: 'a', user: '我', model: 'm', status: 200, total_ms: 1, account: 'x' },
+  { ts: 'b', user: '我', model: 'm', status: 200, total_ms: 2, account: 'x' },
+];
+eq(T.useNewRowsPrefix(prevRows, 2,
+  [{ ts: 'c', user: '我', model: 'm', status: 200, total_ms: 3, account: 'x' }, prevRows[0], prevRows[1]]),
+  1, '顶部新增 1 条 → 增量前缀 k=1');
+eq(T.useNewRowsPrefix(prevRows, 2, prevRows), -1, '无净新增 → 不走增量');
+eq(T.useNewRowsPrefix(prevRows, 2,
+  [{ ts: 'c', user: '我', model: 'm', status: 200, total_ms: 3, account: 'x' }, prevRows[1], prevRows[0]]),
+  -1, '顺序被改动 → 不走增量（防错位插入）');
+
+// 密钥筛选：分桶只含有流量的密钥；没流量的新密钥（配置里有、今天没用过）
+// 也必须出现在「密钥」筛选项里，否则刚加完的密钥永远筛不到。
+T.setKeysData({ keys: [{ id: 'k1', name: '新密钥·没人用', owner: false }] });
+const uOpts = T.fltOptions('user').filter(o => !o.sep);
+ok(uOpts.some(o => o.v === '新密钥·没人用'), '无流量的新密钥出现在「密钥」筛选项');
+eq(uOpts.filter(o => o.v === '新密钥·没人用')[0].n, 0, '新密钥计数显式写 0（今天没用过）');
+T.setKeysData(null);
 
 /* ── 密钥页 ───────────────────────────────────────────────────────── */
 // 盯三件事：行模板列数、默认密钥那行不能出现"删除"、以及「没人用过」要说出来。

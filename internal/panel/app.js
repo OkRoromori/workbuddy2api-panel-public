@@ -2736,7 +2736,7 @@ function paintLogs(force) {
   const vis = visibleLogs(logLines);
   box.innerHTML = vis.length
     ? vis.map(fmtLogLine).join('')
-    : '<span style="color:#6b7280">' + (logLines.length ? '没有符合筛选的日志' : '暂无日志（服务运行中，等任务触发）') + '</span>';
+    : '<span style="color:#8e8e93">' + (logLines.length ? '没有符合筛选的日志' : '暂无日志（服务运行中，等任务触发）') + '</span>';
   const m = $('termMeta');
   if (m) m.textContent = vis.length === logLines.length
     ? logLines.length + ' 行 · 自动刷新 ' + Math.round(POLL_MS / 1000) + 's'
@@ -3042,7 +3042,7 @@ $('btnLogCopy').onclick = () => {
 $('btnLogClear').onclick = () => {
   const box = $('logBox');
   box.dataset.cleared = '1';
-  box.innerHTML = '<span style="color:#6b7280">已清屏（只清前端视图；后端 ring buffer 仍保留日志——下次打开「自动滚动」会重新同步）</span>';
+  box.innerHTML = '<span style="color:#8e8e93">已清屏（只清前端视图；后端 ring buffer 仍保留日志——下次打开「自动滚动」会重新同步）</span>';
 };
 
 /* ── 使用日志（请求审计流水）─────────────────────────────────────────
@@ -3071,6 +3071,17 @@ let useMode = 'all';      // all / stream / sync
 //   slow    首字或总耗时超阈值
 let useStatus = 'all';
 let useQuery = '';
+
+// ── 明细渲染窗口 ────────────────────────────────────────────────────
+// 单日明细服务端上限 2000 条，全量塞进 DOM 是 ~9 万节点：线上实测（1656 行）
+// 整表重画 74–127ms，而轮询每来一批新请求就会重画一次——这就是"请求审计很卡"。
+// 窗口只渲染最近 USE_ROWS_PAGE 行 + 页脚「显示更多」；筛选、搜索与 CSV 导出
+// 仍基于全量数据，不受窗口限制。
+const USE_ROWS_PAGE = 300;
+let useRenderLimit = USE_ROWS_PAGE;  // 当前窗口（点「显示更多」按页扩大）
+let useRenderCtx = '';               // 上次渲染的上下文指纹（日期/域/筛选/搜索）
+let useRenderRows = null;            // 上次渲染的完整筛选结果（增量前缀比对用）
+let useRenderShown = 0;              // 上次真正渲染进 DOM 的行数（不含页脚行）
 
 // 慢请求阈值。前端判定与后端无关，纯展示层概念——写在这里而不是散在渲染里，
 // 保证「筛选慢请求」和「标黄」永远是同一口径。
@@ -3253,6 +3264,19 @@ function renderUseTokStrip(a) {
 // 而大多数维度平时都停在"全部"。
 let fltOpenCat = ''; // 当前展开子菜单的分类
 
+// 「密钥」筛选项的补充名单：已配置但今天没有流量的密钥（含刚加的）。
+// keysData 是进过密钥页才有的缓存；没进过就懒拉一次 /panel/api/keys 补齐，
+// 拉回来若菜单正开着就重画一遍，选项即时出现。null = 尚未拉取。
+let useKeyNamesLazy = null;
+function ensureUseKeyNames() {
+  if (useKeyNamesLazy !== null) return;
+  useKeyNamesLazy = [];
+  api('keys').then(d => {
+    useKeyNamesLazy = ((d && d.keys) || []).map(k => k.name).filter(Boolean);
+    if (view === 'usage' && filterMenuOpen() && fltOpenCat === 'user') renderFilterMenu();
+  }).catch(() => { /* 拉不到就只按分桶显示，不影响其他功能 */ });
+}
+
 // fltOptions 每个分类的可选项。计数取**全天**分桶（不是筛选后），
 // 这样一眼能看出"今天谁在用什么"再决定筛哪个。
 function fltOptions(cat) {
@@ -3263,7 +3287,19 @@ function fltOptions(cat) {
     return [all].concat((d.models || []).map(b => ({ v: b.name, label: b.name, n: b.requests })));
   }
   if (cat === 'user') {
-    return [all].concat((d.users || []).map(b => ({ v: b.name, label: b.name, n: b.requests })));
+    const opts = (d.users || []).map(b => ({ v: b.name, label: b.name, n: b.requests }));
+    // 分桶只含有**当天有流量**的密钥：刚加的新密钥在审计里永远筛不到
+    // （它不在分桶里，计数为 0 就不出现）。把"已配置的密钥名单"并进来，
+    // 计数显式写 0 —— "今天没用过"本身就是筛选时要看的信息。
+    const seen = new Set(opts.map(o => o.v));
+    const extra = [];
+    const addName = n => {
+      n = String(n || '').trim();
+      if (n && !seen.has(n)) { seen.add(n); extra.push({ v: n, label: n, n: 0 }); }
+    };
+    if (keysData && keysData.keys) keysData.keys.forEach(k => addName(k.name));
+    (useKeyNamesLazy || []).forEach(addName);
+    return [all].concat(opts, extra);
   }
   if (cat === 'account') {
     // 账号分桶后端没给，就从明细现算（按出口账号）。
@@ -3398,6 +3434,7 @@ function clearUseFilters() {
 // 而读布局放在渲染路径里会强制同步布局（每次筛选变化都来一次），所以挪到这里。
 let fltFlip = false;
 function openFilterMenu() {
+  ensureUseKeyNames();   // 密钥筛选项要含"没流量的新密钥"（懒拉一次名单）
   const wrap = $('fltWrap');
   if (wrap && wrap.getBoundingClientRect && typeof window !== 'undefined') {
     const vw = window.innerWidth || 1200;
@@ -3449,6 +3486,85 @@ function useRowHTML(r) {
     '</tr>';
 }
 
+// useMoreRowHTML 明细页脚行：窗口外还有多少条 + 一键扩大窗口。
+// 写明「筛选/导出不受窗口限制」——否则用户会以为数据只有这些。
+function useMoreRowHTML(rest, total) {
+  if (rest <= 0) return '';
+  return '<tr class="more-row"><td colspan="8">' +
+    '<button type="button" class="xs ghost" id="useMore">显示更多（' + Math.min(rest, USE_ROWS_PAGE) + ' 条）</button>' +
+    '<span class="mut" style="margin-left:10px">还有 ' + fmtInt(rest) + ' 条未显示 · 筛选与「导出 CSV」覆盖全部 ' + fmtInt(total) + ' 条</span>' +
+    '</td></tr>';
+}
+
+// useRowKey 行的身份键（增量比对用）：取"记录下来就不会变"的字段组合。
+function useRowKey(r) {
+  return (r.ts || '') + '|' + (r.user || '') + '|' + (r.model || '') + '|' + r.status + '|' +
+    (r.total_ms || 0) + '|' + (r.account || '');
+}
+
+// useNewRowsPrefix 增量判定（纯函数，无 DOM）：新列表是否恰好是
+// 「k 条新行 + 旧列表（窗口部分逐行原样）」？是则返回 k，否则 -1。
+// 只比对**已渲染窗口**内的行——窗口外（服务端 2000 上限裁掉的尾部）不影响画面。
+// 连续一次冲进 40 条以上就放弃增量走整窗重画：逐行手术在那种量级没有收益。
+function useNewRowsPrefix(prev, prevShown, rows) {
+  if (!prev || !prev.length || !prevShown) return -1;
+  if (rows.length <= prev.length) return -1;   // 没有净新增（含 2000 上限造成的等长轮换）→ 整窗重画
+  const firstKey = useRowKey(prev[0]);
+  const kmax = Math.min(rows.length - 1, 40);
+  let k = -1;
+  for (let i = 1; i <= kmax; i++) {
+    if (useRowKey(rows[i]) === firstKey) { k = i; break; }
+  }
+  if (k <= 0) return -1;
+  for (let i = 0; i < prevShown; i++) {
+    if (!rows[k + i] || useRowKey(rows[k + i]) !== useRowKey(prev[i])) return -1;
+  }
+  return k;
+}
+
+// paintUseRowsIncremental 轮询的常态路径：顶部插进来 k 条新请求、其余原样。
+// 只把这 k 行插到表头之后、裁掉窗口外的尾巴（~1ms），而不是整表重画（数百行
+// innerHTML 是 15ms 起、曾经的 2000 行是 70–120ms）。
+function paintUseRowsIncremental(rows) {
+  const body = $('useBody');
+  // 假 DOM（测试桩）没有 insertAdjacentHTML / 子元素指针：回落整窗重画，
+  // 测试断言基于 innerHTML，语义不变。
+  if (typeof body.insertAdjacentHTML !== 'function' || !body.lastElementChild) return false;
+  const k = useNewRowsPrefix(useRenderRows, useRenderShown, rows);
+  if (k <= 0) return false;
+
+  // 从尾部动手：摘掉旧页脚、裁掉窗口外的行（保持 DOM 规模恒定）
+  let el = body.lastElementChild;
+  if (el && el.classList && el.classList.contains('more-row')) { el.remove(); el = body.lastElementChild; }
+  const drop = Math.max(0, useRenderShown + k - useRenderLimit);
+  for (let i = 0; i < drop && el; i++) { const p = el.previousElementSibling; el.remove(); el = p; }
+  const winNow = useRenderShown + k - drop;
+
+  body.insertAdjacentHTML('afterbegin', rows.slice(0, k).map(useRowHTML).join(''));
+  const rest = rows.length - winNow;
+  if (rest > 0) body.insertAdjacentHTML('beforeend', useMoreRowHTML(rest, rows.length));
+  useRenderShown = winNow;
+  return true;
+}
+
+// paintUseRows 画表体。窗口（最近 USE_ROWS_PAGE 行）+ 页脚；窗口外的数据
+// 从不进 DOM（筛选、搜索、导出仍见全量）。
+function paintUseRows(rows) {
+  const body = $('useBody');
+  if (!rows.length) {
+    useRenderRows = rows; useRenderShown = 0;
+    body.innerHTML = dashEmpty(8, ((useData.summary || {}).requests || 0)
+      ? '没有符合筛选的记录（换一个筛选条件试试）'
+      : '这一天还没有请求记录');
+    return;
+  }
+  if (paintUseRowsIncremental(rows)) { useRenderRows = rows; return; }
+  const shown = rows.slice(0, useRenderLimit);
+  useRenderShown = shown.length;
+  useRenderRows = rows;
+  body.innerHTML = shown.map(useRowHTML).join('') + useMoreRowHTML(rows.length - shown.length, rows.length);
+}
+
 function renderUsage() {
   if (!useData) return;
   viewSig.usage = useViewSig(); viewDirty.usage = false;
@@ -3467,11 +3583,13 @@ function renderUsage() {
   renderUseKpi(agg);
   renderUseTokStrip(agg);
   renderFilterMenu();
-  $('useBody').innerHTML = rows.length
-    ? rows.map(useRowHTML).join('')
-    : dashEmpty(8, ((useData.summary || {}).requests || 0)
-      ? '没有符合筛选的记录（换一个筛选条件试试）'
-      : '这一天还没有请求记录');
+
+  // 上下文（日期/域/筛选/搜索）变了 → 渲染窗口复位到第一页。
+  // 放进统一的 ctx 比对而不是散在各个调用点，保证不会漏（漏了的表现是"换了筛选还停在旧窗口"）。
+  const ctx = [useDay, panelRealm, useUser, useModel, useAccount, useMode, useStatus, useQuery].join('|');
+  if (ctx !== useRenderCtx) { useRenderCtx = ctx; useRenderLimit = USE_ROWS_PAGE; useRenderRows = null; }
+
+  paintUseRows(rows);
 
   // 条数说明把"截断"和"丢失"都讲清楚：审计是尽力而为的，
   // 静默少给数据比少给本身更糟。
@@ -3479,6 +3597,7 @@ function renderUsage() {
   notes.push(rows.length === (useData.rows || []).length
     ? rows.length + ' 条'
     : rows.length + ' / ' + (useData.rows || []).length + ' 条');
+  if (rows.length > useRenderShown) notes.push('表格显示最近 ' + fmtInt(useRenderShown) + ' 条');
   const acts = useActiveFilters();
   if (acts.length) notes.push('筛选中');
   if (useData.truncated) notes.push('当天超过 ' + (useData.rows || []).length + ' 条，只显示最近的部分');
@@ -3544,7 +3663,23 @@ function useCSV(rows) {
 }
 
 $('useDate').addEventListener('change', () => { loadUsage($('useDate').value); });
-$('useSearch').addEventListener('input', () => { useQuery = $('useSearch').value; renderUsage(); });
+// 搜索防抖：输入过程只更新状态，停 120ms 再重画。
+// 以前是逐键 renderUsage——全量 1656 行时每次击键 30ms+，打字就是连串顿挫。
+let useSearchTimer = 0;
+$('useSearch').addEventListener('input', () => {
+  useQuery = $('useSearch').value;
+  clearTimeout(useSearchTimer);
+  useSearchTimer = setTimeout(renderUsage, 120);
+});
+
+// 「显示更多」：按页扩大渲染窗口。用户主动点击，整窗重画一次可接受（一页几百行
+// 十几毫秒），扩到全量为止。
+$('useBody').addEventListener('click', ev => {
+  const b = ev.target && ev.target.closest ? ev.target.closest('#useMore') : null;
+  if (!b) return;
+  useRenderLimit += USE_ROWS_PAGE;
+  renderUsage();
+});
 
 // 筛选菜单的交互：
 //   点按钮 → 开/关；悬停某个分类 → 展开子菜单（与参考设计一致，比"点开再点"少一步）；
@@ -4890,8 +5025,8 @@ function startQueuePolling() {
 // pkData 最近一次积分构成的响应。数据本身不分域，所以切域只需换一批账号重画，
 // 不必重查上游（那是逐账号查询，面板里最慢的一条路）。
 let pkData = null;
-const PK_COLORS = ['#4f8cff', '#25b08b', '#e8a33d', '#c96bd6', '#e2607a',
-                   '#5aa9e6', '#8fbf3f', '#b58b5a', '#7d8fa8', '#d4785c'];
+const PK_COLORS = ['#007aff', '#34c759', '#ff9500', '#af52de', '#ff2d55',
+                   '#30b0c7', '#5856d6', '#ff3b30', '#32ade6', '#8e8e93'];
 
 function pkColor(i) { return PK_COLORS[i % PK_COLORS.length]; }
 

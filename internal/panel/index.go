@@ -9,6 +9,8 @@
 package panel
 
 import (
+	"bytes"
+	"compress/gzip"
 	"crypto/sha256"
 	_ "embed"
 	"encoding/hex"
@@ -22,17 +24,50 @@ var indexHTML []byte
 //go:embed app.js
 var appJS []byte
 
-// 静态资源指纹：embed 字节编译期即定，进程内算一次。改内容必然改指纹，是
-// 「浏览器拿的是不是最新那份」的唯一判据。
+// 静态资源指纹与预压缩副本：embed 字节编译期即定，两者进程内只算一次。
+// 指纹是「浏览器拿的是不是最新那份」的唯一判据；gzip 副本让每个请求零压缩成本。
 var (
 	indexETag = assetETag(indexHTML)
 	appETag   = assetETag(appJS)
+	indexGz   = gzipBytes(indexHTML)
+	appGz     = gzipBytes(appJS)
 )
 
 // assetETag 内容指纹（sha256 前 16 字节 hex；足够抗碰撞，长度也短）。
 func assetETag(b []byte) string {
 	sum := sha256.Sum256(b)
 	return `"` + hex.EncodeToString(sum[:16]) + `"`
+}
+
+// gzipBytes 预压缩静态资源。面板两份资源未压缩共约 400KB，经隧道/公网每次
+// 冷加载都要全量传输；gzip 后约 130KB（-68%）。失败返回 nil，调用方回落原文。
+func gzipBytes(b []byte) []byte {
+	var buf bytes.Buffer
+	zw, err := gzip.NewWriterLevel(&buf, gzip.BestCompression)
+	if err != nil {
+		return nil
+	}
+	if _, err := zw.Write(b); err != nil {
+		return nil
+	}
+	if err := zw.Close(); err != nil {
+		return nil
+	}
+	return buf.Bytes()
+}
+
+// acceptsGzip 客户端是否接受 gzip（识别 q=0 的显式拒绝）。
+// 不用 strings.Contains 一刀切：`gzip;q=0` 是「明确不要 gzip」，
+// 含子串就压会把不接受 gzip 的客户端喂成乱码。
+func acceptsGzip(r *http.Request) bool {
+	for _, part := range strings.Split(r.Header.Get("Accept-Encoding"), ",") {
+		part = strings.TrimSpace(part)
+		if !strings.HasPrefix(part, "gzip") {
+			continue
+		}
+		return !strings.Contains(part, "q=0")
+	}
+	return false
 }
 
 // csp 内容安全策略（严格版，无需 unsafe-inline）：
@@ -60,32 +95,42 @@ func setSecurityHeaders(w http.ResponseWriter) {
 	w.Header().Set("Cross-Origin-Resource-Policy", "same-origin")
 }
 
-// serveAsset 输出静态资源，带「每次回源校验」的缓存语义。
+// serveAsset 输出静态资源，带「每次回源校验」的缓存语义 + 预压缩协商。
 //
 // 为什么要 ETag + no-cache：面板是 go:embed 资源，部署等于整包换二进制，但**浏览器不会
 // 自己回源**——此前这两个响应没有任何缓存头，浏览器按启发式缓存留住旧副本，于是前端改动
 // 上线后用户看到的还是旧界面（本项目已两次踩到：部署后"没看见更新啊"）。no-cache 要求
 // 每次回源校验，指纹一致回 304；代价是本机回环的一次往返，换来「部署即所见」。
 // 注意不能只写 no-store：那会连页面内的正常复用也丢掉，且无助于诊断"拿的是哪一版"。
-func serveAsset(w http.ResponseWriter, r *http.Request, body []byte, etag, ctype string) {
+//
+// 压缩协商：ETag 跨编码复用（nginx 的常规做法）——ETag 标识资源版本，
+// 编码差异由 Vary: Accept-Encoding 交给缓存层区分，no-cache 下无共享缓存风险。
+func serveAsset(w http.ResponseWriter, r *http.Request, body, gz []byte, etag, ctype string) {
 	setSecurityHeaders(w)
 	w.Header().Set("ETag", etag)
 	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Vary", "Accept-Encoding")
 	if inm := r.Header.Get("If-None-Match"); inm != "" && strings.Contains(inm, etag) {
 		w.WriteHeader(http.StatusNotModified)
 		return
 	}
 	w.Header().Set("Content-Type", ctype)
+	if len(gz) > 0 && acceptsGzip(r) {
+		w.Header().Set("Content-Encoding", "gzip")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(gz)
+		return
+	}
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(body)
 }
 
 // index 输出面板页面（静态无秘密；数据接口 /panel/api/* 才走鉴权）。
 func (p *Panel) index(w http.ResponseWriter, r *http.Request) {
-	serveAsset(w, r, indexHTML, indexETag, "text/html; charset=utf-8")
+	serveAsset(w, r, indexHTML, indexGz, indexETag, "text/html; charset=utf-8")
 }
 
 // appScript 输出前端逻辑（同源脚本，供 CSP script-src 'self' 加载）。
 func (p *Panel) appScript(w http.ResponseWriter, r *http.Request) {
-	serveAsset(w, r, appJS, appETag, "text/javascript; charset=utf-8")
+	serveAsset(w, r, appJS, appGz, appETag, "text/javascript; charset=utf-8")
 }

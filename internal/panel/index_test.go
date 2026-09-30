@@ -1,6 +1,9 @@
 package panel
 
 import (
+	"bytes"
+	"compress/gzip"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -67,5 +70,78 @@ func TestAssetETagsDiffer(t *testing.T) {
 	}
 	if !strings.HasPrefix(indexETag, `"`) || !strings.HasSuffix(indexETag, `"`) {
 		t.Errorf("ETag 需带引号（HTTP 规范），实际 %q", indexETag)
+	}
+}
+
+// TestAssetsGzip 静态资源的压缩协商：接受 gzip 时下发预压缩副本（同 ETag、
+// 带 Vary），解压后与原文逐字节一致；`gzip;q=0` 的显式拒绝必须回落原文；
+// 304 校验路径与编码无关（同 ETag 仍回 304）。
+//
+// 动机：两份资源未压缩共约 400KB，经隧道/公网每次冷加载全量传输；
+// 预压缩后约 130KB。压错了（如把 q=0 也压）表现是客户端乱码白屏，
+// 而本地 curl 一把梭测不出来——所以用测试钉住协商细节。
+func TestAssetsGzip(t *testing.T) {
+	p := newTestPanel()
+	for _, path := range []string{"/panel/", "/panel/app.js"} {
+		recRaw := httptest.NewRecorder()
+		p.ServeHTTP(recRaw, httptest.NewRequest("GET", path, nil))
+		raw := recRaw.Body.Bytes()
+		if len(raw) == 0 {
+			t.Fatalf("%s: 原文为空", path)
+		}
+
+		// 1) 接受 gzip → 压缩副本，解压后与原文一致
+		req := httptest.NewRequest("GET", path, nil)
+		req.Header.Set("Accept-Encoding", "gzip, deflate, br")
+		recGz := httptest.NewRecorder()
+		p.ServeHTTP(recGz, req)
+		if recGz.Code != http.StatusOK {
+			t.Fatalf("%s: gzip 请求 code=%d want 200", path, recGz.Code)
+		}
+		if got := recGz.Header().Get("Content-Encoding"); got != "gzip" {
+			t.Fatalf("%s: Content-Encoding=%q want gzip", path, got)
+		}
+		if v := recGz.Header().Get("Vary"); !strings.Contains(v, "Accept-Encoding") {
+			t.Errorf("%s: Vary=%q 需含 Accept-Encoding", path, v)
+		}
+		if recGz.Header().Get("ETag") != recRaw.Header().Get("ETag") {
+			t.Errorf("%s: 压缩与原文应共用同一 ETag（编码由 Vary 协商）", path)
+		}
+		zr, err := gzip.NewReader(bytes.NewReader(recGz.Body.Bytes()))
+		if err != nil {
+			t.Fatalf("%s: 响应不是合法 gzip: %v", path, err)
+		}
+		got, err := io.ReadAll(zr)
+		if err != nil {
+			t.Fatalf("%s: 解压失败: %v", path, err)
+		}
+		if !bytes.Equal(got, raw) {
+			t.Errorf("%s: 解压内容与原文不一致（got %d bytes want %d）", path, len(got), len(raw))
+		}
+		if recGz.Body.Len() >= len(raw) {
+			t.Errorf("%s: 压缩后 %d 字节未小于原文 %d 字节", path, recGz.Body.Len(), len(raw))
+		}
+
+		// 2) gzip;q=0（明确拒绝）→ 必须回原文，不能压
+		reqQ0 := httptest.NewRequest("GET", path, nil)
+		reqQ0.Header.Set("Accept-Encoding", "gzip;q=0")
+		recQ0 := httptest.NewRecorder()
+		p.ServeHTTP(recQ0, reqQ0)
+		if enc := recQ0.Header().Get("Content-Encoding"); enc != "" {
+			t.Errorf("%s: q=0 时不应压缩，实际 Content-Encoding=%q", path, enc)
+		}
+		if !bytes.Equal(recQ0.Body.Bytes(), raw) {
+			t.Errorf("%s: q=0 时应回原文", path)
+		}
+
+		// 3) 304 路径与编码无关
+		req304 := httptest.NewRequest("GET", path, nil)
+		req304.Header.Set("Accept-Encoding", "gzip")
+		req304.Header.Set("If-None-Match", recRaw.Header().Get("ETag"))
+		rec304 := httptest.NewRecorder()
+		p.ServeHTTP(rec304, req304)
+		if rec304.Code != http.StatusNotModified || rec304.Body.Len() != 0 {
+			t.Errorf("%s: 带 gzip 协商的 304 校验失败 code=%d len=%d", path, rec304.Code, rec304.Body.Len())
+		}
 	}
 }
