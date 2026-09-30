@@ -820,6 +820,14 @@ input[type=number] { -moz-appearance: textfield; appearance: textfield; }
   transform-origin: top left;
 }
 .dd-menu.right { left: auto; right: 0; transform-origin: top right; }
+/* 向下放不下时向上开（app.js 的 ddClipBottom 判定）：菜单挂在按钮上方，
+   入场动画也从下方浮入。覆盖 .pop 的 animation-name 即可，时长/缓动不变。 */
+.dd-menu.up { top: auto; bottom: calc(100% + 6px); transform-origin: bottom left; animation-name: ddUpIn; }
+.dd-menu.up.right { transform-origin: bottom right; }
+@keyframes ddUpIn {
+  from { opacity: 0; transform: translateY(5px) scale(.97); }
+  to   { opacity: 1; transform: none; }
+}
 .dd-o {
   display: flex; align-items: center; gap: 8px; width: 100%;
   padding: 7px 9px; border: 0; border-radius: 8px; cursor: pointer;

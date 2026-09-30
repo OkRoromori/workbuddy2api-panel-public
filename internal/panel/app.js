@@ -417,6 +417,22 @@ function dropdownLabel(sel) {
   return o ? o.textContent : '';
 }
 
+// ddClipBottom 自定义下拉菜单的纵向裁剪边界：视口底边与所有 overflow 非 visible
+// 的祖先容器底边取最小。菜单是 .dd 内的绝对定位元素，越出哪个容器就被哪个裁掉——
+// 只看视口不够（卡片 overflow:hidden 在视口正中也能把菜单裁半截）。
+function ddClipBottom(el) {
+  let bottom = (typeof window !== 'undefined' && window.innerHeight) || 800;
+  if (typeof getComputedStyle !== 'function') return bottom;
+  for (let p = el.parentElement; p && p !== document.documentElement; p = p.parentElement) {
+    const cs = getComputedStyle(p);
+    if (cs.overflowX !== 'visible' || cs.overflowY !== 'visible') {
+      const b = p.getBoundingClientRect().bottom;
+      if (b > 0 && b < bottom) bottom = b;
+    }
+  }
+  return bottom;
+}
+
 // dropdownFor select → 自定义下拉。幂等：同一个 select 调多次只建一层外观。
 function dropdownFor(sel) {
   if (!sel || sel.dataset.ddDone) return;
@@ -456,6 +472,11 @@ function dropdownFor(sel) {
     const vw = window.innerWidth || 1200;
     menu.classList.toggle('right', (vw - r.left) < 200);
     menu.hidden = false; wrap.classList.add('open'); btn.setAttribute('aria-expanded', 'true');
+    // 向下会顶出裁剪容器时翻到上边开。容器 = 视口与所有 overflow 非 visible 的祖先
+    // （卡片 .box 的 overflow:hidden、弹窗 .body 的 overflow:auto 都会把菜单裁半截
+    // ——「选号优先级」在卡片末行时被裁掉下半就是这个原因；光看视口判不出来，
+    // 卡片在视口正中也能裁）。先显示再量高度，同一事件内完成判定，不会闪烁。
+    menu.classList.toggle('up', r.bottom + 6 + menu.getBoundingClientRect().height > ddClipBottom(wrap) - 6);
   };
 
   btn.addEventListener('click', ev => {
