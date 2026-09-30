@@ -1883,6 +1883,15 @@ select.mini {
                 <input name="ttl" placeholder="30m">
                 <span class="hint">改动需重启进程</span></label>
             </div>
+            <div class="grid3">
+              <label class="fld"><span class="lb">选号优先级</span>
+                <select name="pick_priority">
+                  <option value="high_credit">高积分优先</option>
+                  <option value="low_credit">低积分优先</option>
+                  <option value="expiring">快到期积分优先</option>
+                </select>
+                <span class="hint">优先消耗谁的积分：总量多 / 小余额先清 / 快过期的先烧。保存即生效</span></label>
+            </div>
           </div>
         </div>
 

@@ -45,6 +45,10 @@ type Pool struct {
 	// 三因子加权调优（SetWeights 注入；默认值见 defaultIdle*）。
 	idleWeightPerHour float64
 	idleWeightMax     float64
+	// pickPriority 选号积分优先级的取向（SetPickPriority 注入）：
+	// high_credit = 高积分优先（历史默认口径）；low_credit = 低积分优先；
+	// expiring = 快到期积分优先。见 pick.go 的 weightOf。
+	pickPriority string
 	// maxInFlight 单账号最大在途请求数；0 = 不限（租约关闭）。
 	maxInFlight int
 	// maxInFlightGlobal global 域单账号在途上限分档（WAF 403 修复 P1-1：global 域
@@ -79,6 +83,7 @@ func New(stateFp string) *Pool {
 		breakerCooldownMax: defaultBreakerCooldownMax,
 		idleWeightPerHour:  defaultIdleWeightPerHour,
 		idleWeightMax:      defaultIdleWeightMax,
+		pickPriority:       PickPriorityHighCredit,
 		degradeThreshold:   defaultDegradeThreshold,
 		degradeCooldown:    defaultDegradeCooldown,
 		degradeCooldownMax: defaultDegradeCooldownMax,
@@ -169,6 +174,28 @@ func (p *Pool) SetWeights(idlePerHour, idleMax float64) {
 	}
 	if idleMax > 0 {
 		p.idleWeightMax = idleMax
+	}
+}
+
+// SetPickPriority 注入选号积分优先级的取向（main 从 config 解析后调用）。
+// 空/非法值回落高积分优先（PickPriorityHighCredit，历史默认口径）。
+func (p *Pool) SetPickPriority(v string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.pickPriority = NormalizePickPriority(v)
+}
+
+// NormalizePickPriority 把配置值归一为合法枚举：空/未知值一律回落高积分优先。
+// config 校验与 Pool.SetPickPriority 共用同一套口径，保证"配置文件里写错"
+// 与"代码默认"的行为一致。
+func NormalizePickPriority(v string) string {
+	switch strings.TrimSpace(v) {
+	case PickPriorityLowCredit:
+		return PickPriorityLowCredit
+	case PickPriorityExpiring:
+		return PickPriorityExpiring
+	default:
+		return PickPriorityHighCredit
 	}
 }
 

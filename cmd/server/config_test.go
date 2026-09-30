@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/OkRoromori/workbuddy2api-panel-public/internal/pool"
 )
 
 func TestDefault(t *testing.T) {
@@ -756,5 +758,30 @@ func TestNormalizePinsDropsNullAndInvalid(t *testing.T) {
 	c = base(`{" a ":"cn","b":"mars"}`)
 	if len(c.ModelRealm.Pins) != 1 || c.ModelRealm.Pins["a"] != "cn" {
 		t.Errorf("非法值应丢弃/键应去空白，实际 %v", c.ModelRealm.Pins)
+	}
+}
+
+func TestPickPriorityConfig(t *testing.T) {
+	// 缺省 → high_credit（历史口径）：与加这个开关之前的选号行为完全一致。
+	c := Default()
+	if err := c.normalize(); err != nil {
+		t.Fatalf("normalize: %v", err)
+	}
+	if c.Pool.PickPriority != pool.PickPriorityHighCredit {
+		t.Errorf("default pick_priority=%q want %q", c.Pool.PickPriority, pool.PickPriorityHighCredit)
+	}
+	// 文件值：合法值原样保留；非法值归一为 high_credit（配置写错不阻塞启动）。
+	for in, want := range map[string]string{
+		"low_credit": pool.PickPriorityLowCredit,
+		"expiring":   pool.PickPriorityExpiring,
+		"bogus":      pool.PickPriorityHighCredit,
+	} {
+		cc, err := ParseConfig([]byte(`{"pool":{"pick_priority":"` + in + `"}}`))
+		if err != nil {
+			t.Fatalf("ParseConfig(%q): %v", in, err)
+		}
+		if cc.Pool.PickPriority != want {
+			t.Errorf("pick_priority %q → %q want %q", in, cc.Pool.PickPriority, want)
+		}
 	}
 }

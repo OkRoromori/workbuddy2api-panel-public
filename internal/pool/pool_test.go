@@ -44,6 +44,72 @@ func TestPickHighestCredits(t *testing.T) {
 	}
 }
 
+func TestPickPriorityLowCredit(t *testing.T) {
+	withNoPickGap(t)
+	// 低积分优先：小余额账号应被多数选中（先清小号），闲置补偿保证大号不被饿死。
+	p := New("")
+	a1 := &auth.Auth{UID: "u1"}
+	a2 := &auth.Auth{UID: "u2"}
+	a3 := &auth.Auth{UID: "u3"}
+	p.Add(a1)
+	p.Add(a2)
+	p.Add(a3)
+	p.SetCredits("u1", 100, 0)
+	p.SetCredits("u2", 50000, 0)
+	p.SetCredits("u3", 300, 0)
+	p.SetPickPriority(PickPriorityLowCredit)
+	counts := map[string]int{}
+	for i := 0; i < 3000; i++ {
+		counts[p.Pick().UID]++
+	}
+	if counts["u1"] <= counts["u2"] || counts["u3"] <= counts["u2"] {
+		t.Errorf("low_credit: small-balance accounts should be picked most: %v", counts)
+	}
+	if counts["u2"] == 0 {
+		t.Errorf("low_credit: idle compensation should keep the big account alive: %v", counts)
+	}
+}
+
+func TestPickPriorityExpiring(t *testing.T) {
+	withNoPickGap(t)
+	// 快到期优先：快过期积分**绝对量**最大的账号应被多数选中（先烧要作废的），
+	// 与总量大小无关（u2 总量小但快过期多，应压过总量大的 u3）。
+	p := New("")
+	a1 := &auth.Auth{UID: "u1"}
+	a2 := &auth.Auth{UID: "u2"}
+	a3 := &auth.Auth{UID: "u3"}
+	p.Add(a1)
+	p.Add(a2)
+	p.Add(a3)
+	p.SetCreditsDetailed("u1", 5000, 5000, 0)     // 总量小、无快过期
+	p.SetCreditsDetailed("u2", 5000, 5000, 4900)  // 快过期绝对量大
+	p.SetCreditsDetailed("u3", 50000, 50000, 100) // 总量大但要过期的少
+	p.SetPickPriority(PickPriorityExpiring)
+	counts := map[string]int{}
+	for i := 0; i < 3000; i++ {
+		counts[p.Pick().UID]++
+	}
+	if counts["u2"] <= counts["u1"] || counts["u2"] <= counts["u3"] {
+		t.Errorf("expiring: account with most expiring credits should be picked most: %v", counts)
+	}
+}
+
+func TestNormalizePickPriority(t *testing.T) {
+	cases := map[string]string{
+		"":            PickPriorityHighCredit, // 缺省 → 历史口径
+		"high_credit": PickPriorityHighCredit,
+		"low_credit":  PickPriorityLowCredit,
+		"expiring":    PickPriorityExpiring,
+		" expiring ":  PickPriorityExpiring, // 容忍配置文件里的首尾空白
+		"bogus":       PickPriorityHighCredit,
+	}
+	for in, want := range cases {
+		if got := NormalizePickPriority(in); got != want {
+			t.Errorf("NormalizePickPriority(%q)=%q want %q", in, got, want)
+		}
+	}
+}
+
 func TestPickSkipsCooling(t *testing.T) {
 	p := New("")
 	a1 := &auth.Auth{UID: "u1"}

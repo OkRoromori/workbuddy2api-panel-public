@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/OkRoromori/workbuddy2api-panel-public/internal/livecfg"
+	"github.com/OkRoromori/workbuddy2api-panel-public/internal/pool"
 	"github.com/OkRoromori/workbuddy2api-panel-public/internal/prompt"
 )
 
@@ -178,6 +179,12 @@ type Config struct {
 		DegradeCooldownMax string  `json:"degrade_cooldown_max"` // 降权时长的上限钳制，默认 "2h"（仅当 cooldown 超该值才钳制）
 		IdleWeightPerHour  float64 `json:"idle_weight_per_hour"` // 闲置补偿：每小时未用 +0.5 权重
 		IdleWeightMax      float64 `json:"idle_weight_max"`      // 闲置补偿封顶，默认 5.0
+		// PickPriority 选号积分优先级的取向：
+		//   "high_credit"（默认）= 高积分优先（历史口径）；
+		//   "low_credit"        = 低积分优先（小余额先消耗）；
+		//   "expiring"          = 快到期积分优先（先烧要作废的）。
+		// 空/未知值归一为 high_credit。改动热生效（面板保存后立即换向）。
+		PickPriority string `json:"pick_priority"`
 		// ExpiringSoon 快过期积分窗口（如 "168h"=7天）：签到/余额刷新时，到期时间在
 		// 此窗口内的积分被标记为"快过期"，选号优先消耗。空/0 = 禁用分桶。
 		ExpiringSoon string `json:"expiring_soon"`
@@ -266,6 +273,7 @@ func Default() *Config {
 	c.Pool.DegradeCooldownMax = "2h"
 	c.Pool.IdleWeightPerHour = 0.5
 	c.Pool.IdleWeightMax = 5.0
+	c.Pool.PickPriority = pool.PickPriorityHighCredit
 	c.Pool.ExpiringSoon = "168h" // 快过期窗口默认 7 天：官方活动奖励积分多在两周内过期
 	// costTier 探索默认 30m（issue #136：垄断破除 + 搭车改道零新增请求）；"0" 关停。
 	c.Pool.CostExploreInterval = "30m"
@@ -499,6 +507,8 @@ func (c *Config) normalize() error {
 	if c.Pool.IdleWeightMax <= 0 {
 		c.Pool.IdleWeightMax = 5.0
 	}
+	// 选号优先级：空/未知值归一为高积分优先（历史口径），与 Pool.SetPickPriority 同源。
+	c.Pool.PickPriority = pool.NormalizePickPriority(c.Pool.PickPriority)
 	if c.Upstream.TimeoutSeconds <= 0 {
 		c.Upstream.TimeoutSeconds = 120
 	}

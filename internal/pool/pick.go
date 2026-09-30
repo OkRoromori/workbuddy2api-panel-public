@@ -330,19 +330,45 @@ func (p *Pool) pickWeighted(cands []*entry) *entry {
 	return cands[len(cands)-1]
 }
 
-// weightOf 计算单个账号的三因子权重。
+// 选号积分优先级（config: pool.pick_priority，SetPickPriority 注入）。
+// 默认高积分优先 = 历史口径，行为与加这个开关之前完全一致。
+const (
+	PickPriorityHighCredit = "high_credit" // 高积分优先（默认）：积分多的号先用
+	PickPriorityLowCredit  = "low_credit"  // 低积分优先：小余额先消耗，用完腾号
+	PickPriorityExpiring   = "expiring"    // 快到期积分优先：先烧要作废的积分
+)
+
+// weightOf 计算单个账号的权重：积分因子（方向由 pickPriority 决定）×10 + 闲置补偿。
+//
+// 无论哪个方向，都保留闲置补偿与下面的 top5+加权随机架构——"优先级"调的是
+// 偏好方向，不是"必须选某一个号"：硬性排序会让全部流量压在一个号上（惊群/限流）。
 func (p *Pool) weightOf(e *entry, maxCredits int64, now time.Time) float64 {
 	w := 1.0
-	// 1. credits 比例 ×10（会计入 mid-credit 锚点，避免全员 0 时 credits 项为 0）。
-	if maxCredits > 0 {
-		w += float64(e.credits) / float64(maxCredits) * 10
-	}
-	// 1b. 快过期积分加成：官方活动赠送的奖励积分按批过期，不用就作废。
-	// creditsExpiring 占总量比例越高，越应优先被消耗——把"快过期占比"作为独立的
-	// 强权重项（×expiringWeight），让快过期积分多的号优先选。与 credits 总量项
-	// 正交：那是按总量，这是按过期紧迫度。
-	if e.credits > 0 && e.creditsExpiring > 0 {
-		w += float64(e.creditsExpiring) / float64(e.credits) * expiringWeight
+	// 1. 积分因子 ×10。分母统一用候选集内最大 credits（量纲一致，两阶段权重可比）：
+	//    high_credit：积分比例（多分优先），外加"快过期占比 ×8"加成（历史口径）；
+	//    low_credit： 反向比例 1-credits/max（小余额先消耗）——不加过期项，避免方向打架；
+	//    expiring：   快过期积分绝对量 / max（先烧要作废的）——零过期号只拿基础权重，
+	//                 语义 = "先把快过期的处理掉，其余照常轮换"。
+	switch p.pickPriority {
+	case PickPriorityLowCredit:
+		if maxCredits > 0 {
+			w += (1 - float64(e.credits)/float64(maxCredits)) * 10
+		}
+	case PickPriorityExpiring:
+		if maxCredits > 0 && e.creditsExpiring > 0 {
+			w += float64(e.creditsExpiring) / float64(maxCredits) * 10
+		}
+	default: // high_credit（含未设置）
+		if maxCredits > 0 {
+			w += float64(e.credits) / float64(maxCredits) * 10
+		}
+		// 快过期积分加成：官方活动赠送的奖励积分按批过期，不用就作废。
+		// creditsExpiring 占总量比例越高，越应优先被消耗——把"快过期占比"作为独立的
+		// 强权重项（×expiringWeight），让快过期积分多的号优先选。与 credits 总量项
+		// 正交：那是按总量，这是按过期紧迫度。
+		if e.credits > 0 && e.creditsExpiring > 0 {
+			w += float64(e.creditsExpiring) / float64(e.credits) * expiringWeight
+		}
 	}
 	// 2. 闲置补偿。
 	if e.lastUsed.IsZero() {
