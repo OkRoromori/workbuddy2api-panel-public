@@ -318,7 +318,6 @@ html = setText(html, 'dashKeyNote', getEl('dashKeyNote').textContent);
 html = setText(html, 'navState', getEl('navState').textContent);
 html = setText(html, 'navVer', getEl('navVer').textContent);
 html = setText(html, 'navRedis', getEl('navRedis').textContent);
-html = setInner(html, 'navSub', getEl('navSub').textContent); // navSub 是 div
 html = setText(html, 'subMeta', getEl('subMeta').textContent);
 // navPulse：applyStatus 会改写整个 class（pulse / pulse warn / pulse bad），
 // 原标记写作 class="pulse"，这里整段换掉，避免出现两个 class 属性。
