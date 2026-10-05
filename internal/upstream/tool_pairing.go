@@ -227,9 +227,8 @@ func cleanupOrphanToolCalls(messages []any) ([]any, bool) {
 
 // mergeAdjacentToolCalls 把**背靠背**的 assistant.tool_calls 消息合成一条（tool_calls 依原序拼接）。
 //
-// 2026-09-20 实机定位并复现的 11148 事故根因：Responses 协议把并行工具调用发成多条独立
-// function_call item，翻译层（server/responses.go responsesInputToMessages）为每条 item 生成
-// 一条独立 assistant 消息，于是出站载荷里同一批调用长成两条紧邻的消息：
+// 2026-09-20 实机定位并复现的 11148 事故根因：部分 OpenAI 兼容 agent 客户端回放历史时把
+// 同一批并行工具调用拆成多条紧邻的独立 assistant 消息，出站载荷长成：
 //
 //	assistant tool_calls=[c00]
 //	assistant tool_calls=[c01]
@@ -288,9 +287,8 @@ func mergeAdjacentToolCalls(messages []any) ([]any, bool) {
 			// assistant → 把正文折进上一条，合成 assistant(正文 + tool_calls)。这样
 			// "声明 tool_calls 的 assistant 紧跟它自己的结果"在两种拆分顺序下都成立。
 			//
-			// 谁会产出这个顺序：本网关 Responses 非流式输出此前把 function_call 排在
-			// message 之前（已改为 message 在前，历史报文仍会被客户端原样回放），
-			// 以及部分 OpenAI 兼容 agent 客户端的回放顺序。
+			// 谁会产出这个顺序：部分 OpenAI 兼容 agent 客户端的回放顺序（正文与
+			// 调用声明拆成两条独立 assistant）。
 			//
 			// 条件同样从严：只认**字符串正文**（数组正文可能含多模态块，拼接会丢结构，
 			// 交给 repackToolResultBlocks 原样处理）；上一条必须自身无正文。

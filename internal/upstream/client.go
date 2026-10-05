@@ -14,8 +14,10 @@ import (
 	"net/url"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/OkRoromori/workbuddy2api-panel-public/internal/auth"
@@ -33,11 +35,12 @@ const (
 	ErrNotFound                      // 404 上游偶发 → 短冷却，不累计错误计数（防雪崩）
 	ErrServer                        // 5xx 上游故障
 	ErrContentBlocked                // 内容策略拦截（400 + 审核文案）→ 不罚账号，走降级重试
-	ErrBadParams                     // 请求体解析失败（400 + Unmarshal chat params failed / 11101）→ 不罚账号，仍轮转
+	ErrBadParams                     // 请求体解析失败（400 + Unmarshal chat params failed / 11101）→ 请求级错误：不罚号、不轮转，末端 400 透传原文
 	ErrAccountFault                  // 账号级授权/配额故障（11140 request illegal / 14017 trial not activated）→ 冷却轮换，不无限重试
 	ErrModelBlocked                  // 11102「该后端无此模型」→ (账号,模型) 负缓存避让，切模型/切账号
 	ErrWafBlock                      // 403 + 非业务信封体（APISIX WAF 拦截页/空体）→ 账号软冷却 + 抖动退避
 	ErrPromptTooLong                 // 11115「prompt is too long」→ 请求级错误（上下文超限是请求的问题非账号的问题）：不罚号、不轮转，末端透传原文
+	ErrImageInvalid                  // 图片请求格式/数据无效 → 请求级错误：不罚号、不轮转，末端透传原文
 	ErrClient                        // 其他 4xx / 业务错误
 )
 
@@ -63,6 +66,8 @@ func (k ErrKind) String() string {
 		return "waf_block"
 	case ErrPromptTooLong:
 		return "prompt_too_long"
+	case ErrImageInvalid:
+		return "image_invalid"
 	case ErrAccountFault:
 		return "account_fault"
 	case ErrClient:
@@ -153,7 +158,20 @@ var contentBlockedMarkers = []string{
 // 与账号健康无关——不罚号，但仍轮转（commit B）。
 var badParamsMarkerMsg = "Unmarshal chat params failed"
 
-// promptTooLongMarkers 11115「prompt is too long」判定。
+// invalidImageMarkers 图片请求格式/数据无效（HTTP 400）的**文案**形态。这类错误由
+// 请求内容决定，不是账号问题：换账号不会改变同一 body 的解析结果。上游常见形态包括
+// `Parse message failed: invalid image_url content`、invalid_image_data、
+// `replace the image`。
+//
+// 业务码 11135 不放在这里：code 判定必须容忍 JSON 空白（`"code": 11135`），
+// 字面量 marker 只能覆盖紧凑形态，故统一走 codeMarker（见 Classify 的 400 分支，
+// 与 hint.go 的 isInvalidImageData 同口径；上游 5d5223d 的 Copilot review 修复）。
+var invalidImageMarkers = []string{
+	"invalid image_url content",
+	"invalid_image_data",
+	"replace the image",
+}
+
 // 定位：上下文超限是**请求的问题不是账号的问题**——同一个 body 换任何账号发都会
 // 超限，与 WAF fail-fast 同哲学（确定与账号无关的错误不罚号不轮转，白白浪费健康号
 // 的请求配额）。marker 双通道：
@@ -274,6 +292,38 @@ func IsModelBlocked(status int, body string) bool {
 	return strings.Contains(strings.ToLower(msg), modelBlockMsgMarker)
 }
 
+// hasBusinessCode reports whether a JSON error envelope contains an exact
+// business code in a field named "code". Upstream envelopes vary between
+// top-level and nested error/data objects, so walk the decoded structure.
+func hasBusinessCode(body, want string) bool {
+	var root any
+	if err := json.Unmarshal([]byte(body), &root); err != nil {
+		return false
+	}
+	var walk func(any) bool
+	walk = func(value any) bool {
+		switch node := value.(type) {
+		case map[string]any:
+			if code, ok := node["code"]; ok && strings.TrimSpace(fmt.Sprint(code)) == want {
+				return true
+			}
+			for _, child := range node {
+				if walk(child) {
+					return true
+				}
+			}
+		case []any:
+			for _, child := range node {
+				if walk(child) {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	return walk(root)
+}
+
 // hasBusinessEnvelope 报告错误 body 是否携带上游业务信封形态（JSON 且含
 // `"code":` 或 `"msg":` 字段）。WAF 403 判定（IsWafBlocked）用「无业务信封」
 // 区分 APISIX WAF 拦截页（HTML/空体/纯文本）与上游业务层 403（带 code/msg
@@ -355,8 +405,16 @@ func parseRetryNumber(v, headerName string) (time.Duration, bool) {
 	}
 	switch headerName {
 	case "Retry-After":
+		// 先做上限校验再乘 time.Second：16 位数字乘 1e9 会溢出 int64 回绕成
+		// 小正数，进而通过调用方的 retryAfterSanity 校验被当作合法等待时长。
+		if n > int64(retryAfterSanity/time.Second) {
+			return 0, false
+		}
 		return time.Duration(n) * time.Second, true
 	case "Retry-After-Ms":
+		if n > int64(retryAfterSanity/time.Millisecond) {
+			return 0, false
+		}
 		return time.Duration(n) * time.Millisecond, true
 	default: // X-Ratelimit-Reset：epoch → 剩余量
 		sec := n
@@ -411,21 +469,23 @@ func ParseRateReset(body string) (time.Time, bool) {
 //     限流可指数退避等自愈，账号级故障等不来）。11140 的 model 级限流变体
 //     （rate-limiting 文案）因 marker 不含该文案而天然落到 softRateMarkers 层，
 //     不受影响。
-//  4. status==429 —— 限流状态码兜底（先于 hardMarkers）：429 body 高频携带
+//  4. 429 + code 14018 —— 明确的账号积分耗尽，归 ErrHardCredit（issue #175）。
+//     只认结构化业务码，不靠可能跨计费/限流两界的文案猜测。
+//  5. status==429 —— 限流状态码兜底（先于 hardMarkers）：429 body 高频携带
 //     "quota exceeded"/"额度不足" 等跨计费/限流两界的措辞，hardMarkers 先判会把
 //     限流误归 ErrHardCredit 硬冷却到次日 04:00，白扔号约 12h。状态码是比关键词
-//     更权威的信号；真正的余额耗尽由 402（第 1 层）捕获，非 429 状态码的 quota
-//     措辞仍走下方 hardMarkers（第 5 层）。
-//  5. hardMarkers —— 非 429 响应携带计费关键词（200 业务信封 / 403 信封等）。
-//  6. softRateMarkers —— 非 429 状态码携带限流文案（issue #28 修复点）。
+//     更权威的信号；真正的余额耗尽由 402（第 1 层）或 14018（第 4 层）捕获，
+//     非 429 状态码的 quota 措辞仍走下方 hardMarkers（第 6 层）。
+//  6. hardMarkers —— 非 429 响应携带计费关键词（200 业务信封 / 403 信封等）。
+//  7. softRateMarkers —— 非 429 状态码携带限流文案（issue #28 修复点）。
 //     位于此处可覆盖 200/400/403/5xx 各状态码。
-//  7. 11115 —— 「prompt is too long」请求级语义：判在 404/5xx 与通用 4xx 兜底
+//  8. 11115 —— 「prompt is too long」请求级语义：判在 404/5xx 与通用 4xx 兜底
 //     之前（404 上打 11115 若落 ErrNotFound 会误冷却账号——上下文超限与账号无关）。
-//  8. 404 / 5xx —— 与限流无关的常规分类。
-//  9. IsWafBlocked —— 403 且无业务信封（HTML 拦截页/空体/纯文本）：APISIX WAF
+//  9. 404 / 5xx —— 与限流无关的常规分类。
+//  10. IsWafBlocked —— 403 且无业务信封（HTML 拦截页/空体/纯文本）：APISIX WAF
 //     拦截形态。判在通用 4xx 兜底**之前**：此前该形态落 ErrClient → 只换号不罚 →
 //     连环 403。带业务信封的 403 已被上方各层捕获，走不到本层。
-//  10. 内容策略/参数错误/其他 4xx —— 通用兜底。
+//  11. 内容策略/参数错误/其他 4xx —— 通用兜底。
 func Classify(status int, body string) ErrKind {
 	// 11102「该后端无此模型」须最先判：它是「模型在后端不存在」的确定性答复，语义比
 	// 计费/限流都更具体——若不先判，msg 里的 "service info not found" 会被更宽的
@@ -452,12 +512,18 @@ func Classify(status int, body string) ErrKind {
 			return ErrAccountFault
 		}
 	}
+	// 14018 是明确的账号积分耗尽业务码。它必须先于通用 429 兜底，否则会被误判为
+	// 可自愈的软限流并在全池冷却时反复兜底选中（issue #175）。仅按结构化 code
+	// 判定；无该 code 的 "credits exhausted" 文案仍保持普通 429 的软限流语义。
+	if status == http.StatusTooManyRequests && hasBusinessCode(body, "14018") {
+		return ErrHardCredit
+	}
 	// status==429 先于 hardMarkers：限流响应 body 高频携带 "quota exceeded"/
 	// "额度不足" 等跨计费/限流两界的措辞，hardMarkers 先判会把限流误归
 	// ErrHardCredit 硬冷却到次日 04:00，白扔号约 12h。状态码是比关键词更权威的
 	// 信号：上游既然给了 429，就按限流语义处理（宁可短冷却自愈，不可长冷却弃号）；
-	// 真正的余额耗尽由 402（上层）捕获，非 429 状态码的 quota 措辞仍走下方
-	// hardMarkers（历史语义不变）。
+	// 真正的余额耗尽由 402（上层）或 14018（上层）捕获，非 429 状态码的 quota
+	// 措辞仍走下方 hardMarkers（历史语义不变）。
 	if status == http.StatusTooManyRequests {
 		return ErrSoftRate
 	}
@@ -494,6 +560,19 @@ func Classify(status int, body string) ErrKind {
 	if IsWafBlocked(status, body) {
 		return ErrWafBlock
 	}
+	// 图片格式/数据错误是确定性的请求级错误：同 body 换账号结果不变，直接
+	// fail-fast，避免把健康账号轮转一遍后仍把最终 503 返回给客户端。
+	// 11135 业务码走 codeMarker（JSON 空白容差），文案走 invalidImageMarkers。
+	if status == http.StatusBadRequest && codeMarker(lower, "11135") {
+		return ErrImageInvalid
+	}
+	if status == http.StatusBadRequest {
+		for _, m := range invalidImageMarkers {
+			if strings.Contains(lower, m) {
+				return ErrImageInvalid
+			}
+		}
+	}
 	// 内容策略拦截（HTTP 400 + 审核文案）：判在通用 ErrClient 之前。
 	// 这是误报信号，不罚账号，由网关降级重试处理（见 handler.applyErrorPolicy）。
 	if status >= 400 {
@@ -505,8 +584,9 @@ func Classify(status int, body string) ErrKind {
 		// 请求体解析失败（HTTP 400 + Unmarshal chat params failed / code 11101）：
 		// 这是"发给上游的 body 有问题"。网关侧截断已由 413 消灭（issue #41 commit A），
 		// 剩余来源是客户端 JSON 本身畸形——换了账号照样 400，不该罚号（白白冷却好号）。
-		// 归 ErrBadParams：不冷却/不熔断/不计错，但**仍然轮转**（不同账号可能有不同的
-		// 模型权限，值得再试一次）。
+		// 归 ErrBadParams：不冷却/不熔断/不计错，且**不轮转**——11101 发生在上游解析
+		// 请求体阶段，还没走到模型路由，所以"不同账号可能有不同模型权限"其实是
+		// 11102（ErrModelBlocked）的理由，那里已有 (账号,模型) 负缓存避让。
 		if strings.Contains(body, badParamsMarkerMsg) || strings.Contains(body, badParamsMarkerCode) {
 			return ErrBadParams
 		}
@@ -546,13 +626,17 @@ type Client struct {
 	// thinking.go 补档：缺显式 effort 时优先用模型声明默认档，空串回退硬编码 high。
 	// 与 efforts 同 realm 分层桶（同 C-2 隔离原则），共用 effortsMu。
 	defaultEfforts map[string]map[string]string
+	// modelRates 缓存各模型当前生效积分倍率（规范化数值，如 "0.5"）。
+	// 与 efforts 共用 realm 分层和锁；每次成功刷新模型目录时整体替换对应域。
+	modelRates map[string]map[string]string
 
 	// globalModels 缓存 global 模型名目录探测结果（成功 ∩ 静态 overlay；
 	// 1h TTL + 5min 负缓存），见 global_models.go。按实例持有，测试新建 Client 即隔离。
 	globalModels fetchGlobalModelsCache
 
 	// SanitizeFingerprints 出站请求体黑名单指纹脱敏开关（默认 true；false 完全还原）。
-	SanitizeFingerprints bool
+	// 面板保存配置热改 + chat 热路径并发读写，用 atomic.Bool 消除数据竞争。
+	SanitizeFingerprints atomic.Bool
 
 	// UserAgent 出站 User-Agent 显式覆盖（非空时全路径生效，优先于默认三段式）。
 	// 空 = 默认官方形态：chat/refresh/FetchModels 走
@@ -604,17 +688,18 @@ type Client struct {
 // kongjianguan 4 连击实测经验）。
 func New() *Client {
 	tr := newTransport()
-	return &Client{
-		HTTP:                 &http.Client{Timeout: 120 * time.Second, Transport: tr},
-		ChatHTTP:             &http.Client{Timeout: 0, Transport: tr}, // 无总时长；首字节由 ResponseHeaderTimeout 管
-		SanitizeFingerprints: true,
-		ChatBaseCN:           "https://copilot.tencent.com",
-		BillingBaseCN:        "https://www.codebuddy.cn",
-		WebBaseCN:            "https://www.workbuddy.cn",
+	c := &Client{
+		HTTP:          &http.Client{Timeout: 120 * time.Second, Transport: tr},
+		ChatHTTP:      &http.Client{Timeout: 0, Transport: tr}, // 无总时长；首字节由 ResponseHeaderTimeout 管
+		ChatBaseCN:    "https://copilot.tencent.com",
+		BillingBaseCN: "https://www.codebuddy.cn",
+		WebBaseCN:     "https://www.workbuddy.cn",
 		// GlobalEnabled 缺省 true（与 config global.enabled 缺省 true 一致；纯 CN 部署行为不变：
 		// CN 账号恒判 cn，global base 只在 realm=global 的账号上被使用）。
 		GlobalEnabled: true,
 	}
+	c.SanitizeFingerprints.Store(true)
+	return c
 }
 
 // chatHTTP 返回聊天专用 client；未设置（如测试只注入 HTTP）时回落 HTTP。
@@ -698,7 +783,6 @@ func (c *Client) chatBase(a *auth.Auth) string {
 }
 
 // prepareBody 组装出站请求体（脱敏开关由 Client.SanitizeFingerprints 控制）。
-// prepareBody 组装出站请求体（脱敏开关由 Client.SanitizeFingerprints 控制）。
 // realm 为账号 Realm()（cn/global），供 efforts 缓存分桶（跨域 effort 集合不互相污染）。
 func (c *Client) prepareBody(body []byte, realm, uid, conversationID string) []byte {
 	efforts, defs := c.effortsSnapshot(realm), c.defaultEffortsSnapshot(realm)
@@ -708,7 +792,7 @@ func (c *Client) prepareBody(body []byte, realm, uid, conversationID string) []b
 		//（issue #84：往 WorkBuddy 上游发 low/max 非法，须降级到 high）。
 		efforts, defs = globalEffortMap(efforts, defs)
 	}
-	body = PrepareBodyOptWithEffortsAndDefault(body, c.SanitizeFingerprints, efforts, defs)
+	body = PrepareBodyOptWithEffortsAndDefault(body, c.SanitizeFingerprints.Load(), efforts, defs)
 	// prompt_cache_key 注入（P0 费用优化，费用降 ~17×）：按账号隔离的稳定缓存键，
 	// 让同一客户端对同一账号的连续请求命中上游前缀缓存。
 	body = InjectPromptCacheKey(body, uid, conversationID)
@@ -1021,6 +1105,15 @@ type ModelInfo struct {
 	CanDisableThinking bool     // reasoning.canDisableThinking：思考可关（off 档可用）
 	ReasoningEffort    string   // reasoning.effort 推理模式（与 supportedEfforts 数组不同源）
 	ReasoningSummary   string   // reasoning.summary 推理摘要模式（如 "auto"）
+
+	// 优惠（modelPromotions，/v3/config data.modelPromotions）：Credits 是**牌价**
+	//（转正后基准倍率），Promo* 是当前生效的限时优惠——面板据此显示「生效价 +
+	// 标签 + 牌价」。PromoFactor 为 nil 表示无 machine-readable 折扣（如「错峰
+	// 使用」只有时段文案无 factor），仅挂标签/提示。
+	PromoFactor  *float64 // 折扣系数（0=限时免费，0.5=五折）；nil=无
+	PromoCredits string   // 折扣后倍率原文（如 "0x" / "0.50x"），仅展示
+	PromoLabel   string   // 徽章文案（限时免费 / 夜间折扣 / 错峰使用）
+	PromoNote    string   // hover 说明原文（含时段/日期描述）
 }
 
 // dynModelEntry 上游模型目录（CN /console 与 global /v2 同构）的单条模型解析形态，
@@ -1090,7 +1183,13 @@ func (m dynModelEntry) modelInfo() ModelInfo {
 // 来源：harness buddy.ts:547-555。三类规则：
 //   - id 前缀 nes-/completion-/codewise-：嵌入/补全/代码专用模型，选了报 code=11102。
 //   - maxOutputTokens ≤ 256：tiny 输出非对话模型。
-//   - tags 含 text-to-image：图片生成模型，非本网关用途。
+//   - tags 含生成类标签（图片/视频）：生成模型走各自专用端点，作为对话模型
+//     选上去只会报 11102，非本网关用途。
+//
+// 生成类标签随上游扩充：早期只有 text-to-image，桌面端目录（2026-10-02 实测）
+// 另有 text-to-video / image-to-video（seedance 系列）与 image-to-image
+// （gpt-image 系列）——后者已由 text-to-image 覆盖，此处补齐视频两类。
+// 注意本函数 CN 与 global 共用，新增标签对两域同时生效。
 func nonChatModel(id string, maxOutputTokens int64, tags []string) bool {
 	id = strings.ToLower(strings.TrimSpace(id))
 	for _, p := range [...]string{"nes-", "completion-", "codewise-"} {
@@ -1102,7 +1201,8 @@ func nonChatModel(id string, maxOutputTokens int64, tags []string) bool {
 		return true
 	}
 	for _, t := range tags {
-		if t == "text-to-image" {
+		switch t {
+		case "text-to-image", "image-to-image", "text-to-video", "image-to-video":
 			return true
 		}
 	}
@@ -1116,11 +1216,12 @@ func nonChatModel(id string, maxOutputTokens int64, tags []string) bool {
 // 版本号需随上游 IDE 发版跟进：UAn 版本过旧时该端点可能同样返回精简目录。
 const codeBuddyIDEUA = "CodeBuddyIDE/4.12.0 CodeBuddy/4.12.0"
 
-// codeBuddyCLIUA /v3/config 的**端侧（CLI）UA**：与 IDE UA 的目录**互补**，必须一起探
-//（见 fetchV3ConfigModelMap 的实测数据：第三方模型族只在 CLI 目录里下发）。
+// codeBuddyCLIUA /v3/config 的端侧（CLI）UA：与 IDE UA 的目录**互补**，必须一起探。
 // 判别点是 UA 里带 "WorkBuddy"（端侧产品名）而非 "CodeBuddyIDE"：实测
-// "WorkBuddy/5.5.2 CLI/2.137.1" 与裸 "WorkBuddy" 都返回完整第三方目录，
-// 而 "CodeBuddy/4.12.0" 返回空目录。版本号同样需随上游发版跟进。
+// "WorkBuddy/5.5.2 CLI/2.137.1" 与裸 "WorkBuddy" 都返回完整第三方目录
+// （glm / gpt / kimi / deepseek / hy3 / hy4…），而 "CodeBuddy/4.12.0" 返回空目录。
+// 上游 2026-09-22 亦有同类实测：IDE/CLI 下发的模型集合不同、各有独有模型，缺一不可。
+// 版本号需随上游发版跟进。
 const codeBuddyCLIUA = "WorkBuddy/5.5.2 CLI/2.137.1"
 
 // FetchModels 调上游动态模型接口（CN 侧；global 账号见 global_models.go 家族）。
@@ -1161,6 +1262,7 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 	if len(out) == 0 {
 		return nil, fmt.Errorf("models api returned empty list")
 	}
+	c.storeModelRates(a.Realm(), out)
 	// 刷新 effort 能力缓存（供请求体降级；无 supportedEfforts 的模型不入桶）。
 	// 空桶时跳过写：避免「某探测无档位数据」清掉既有桶。
 	cache := make(map[string][]string, len(out))
@@ -1281,17 +1383,32 @@ func (c *Client) fetchEnterpriseModels(a *auth.Auth) ([]ModelInfo, error) {
 	return out, nil
 }
 
-// fetchV3Models 单路探测 /v3/config（IDE UA 完整能力版，见 codeBuddyIDEUA）。
+// fetchV3Models CN 侧目录探测：IDE 与 CLI 两路 **并集**（本分支实测结论：该端点
+// 对 UA 敏感且两路目录互补——IDE 给内部/工具族，CLI 给第三方模型族
+// glm/gpt/kimi/deepseek；CN 与 global 同结论。上游对 global 用三路探测，CN 走双路）。
+// 单路失败用另一路 + warn，双路全失败才报错（调用方降级为仅企业端点）。
 // v3 面取全量 models（不按 agents[cli] 过滤，与 global 探测口径一致），按同一
 // nonChatModel 规则剔除非对话条目（selected 会选模型报 code=11102）。
-// 失败返回错误（调用方降级为仅企业端点）。
 func (c *Client) fetchV3Models(a *auth.Auth) ([]ModelInfo, error) {
-	byID, err := c.fetchV3ConfigModelMap(a)
-	if err != nil {
-		return nil, err
+	ideMap, ideErr := c.fetchV3ConfigModelMap(a, codeBuddyIDEUA)
+	cliMap, cliErr := c.fetchV3ConfigModelMap(a, codeBuddyCLIUA)
+	if ideErr != nil && cliErr != nil {
+		return nil, fmt.Errorf("v3/config（IDE 与 CLI 两路都失败）: %v / %v", ideErr, cliErr)
 	}
-	out := make([]ModelInfo, 0, len(byID))
-	for _, mi := range byID {
+	if ideErr != nil {
+		log.Printf("WARN: [upstream] v3/config IDE UA 失败（仅用 CLI 目录）: %v", ideErr)
+		ideMap = map[string]ModelInfo{}
+	} else if cliErr != nil {
+		log.Printf("WARN: [upstream] v3/config CLI UA 失败（仅用 IDE 目录）: %v", cliErr)
+	}
+	// 并集：IDE 条目优先（冲突时保留既有显示与降级口径），CLI 只补缺。
+	for id, mi := range cliMap {
+		if _, ok := ideMap[id]; !ok {
+			ideMap[id] = mi
+		}
+	}
+	out := make([]ModelInfo, 0, len(ideMap))
+	for _, mi := range ideMap {
 		if nonChatModel(mi.ID, mi.MaxTokens, mi.Tags) {
 			continue
 		}
@@ -1301,6 +1418,143 @@ func (c *Client) fetchV3Models(a *auth.Auth) ([]ModelInfo, error) {
 		return nil, fmt.Errorf("v3/config returned empty models")
 	}
 	return out, nil
+}
+
+// v3ModelPromotion /v3/config data.modelPromotions 单条优惠定义（2026-09-23 实测
+// 7 条：deepseek 系错峰五折、glm-5.2 夜间五折、hy3 与 hy4-preview-f 限时免费）。
+// discount 只在部分条目上存在：有 factor 的可算生效价；「错峰使用」类只有时段
+// 文案（factor 藏在 hover 文本里，无机器可读值），仅透出标签与说明。
+type v3ModelPromotion struct {
+	Enabled  bool     `json:"enabled"`
+	Priority int      `json:"priority"`
+	ModelIDs []string `json:"modelIds"`
+	Badge    *struct {
+		Label string `json:"label"`
+	} `json:"badge"`
+	Discount *struct {
+		DiscountedCredits string  `json:"discountedCredits"`
+		Factor            float64 `json:"factor"`
+	} `json:"discount"`
+	Hover *struct {
+		TextZh string `json:"textZh"`
+	} `json:"hover"`
+	Schedule *struct {
+		Daily []struct {
+			Start string `json:"start"` // "23:00"
+			End   string `json:"end"`   // "7:50"（可跨午夜）
+		} `json:"daily"`
+		Timezone   string `json:"timezone"`  // 实测恒 Asia/Shanghai
+		ValidFrom  string `json:"validFrom"` // RFC3339，可缺省
+		ValidUntil string `json:"validUntil"`
+	} `json:"schedule"`
+}
+
+// promoZone 优惠时区：上游恒 Asia/Shanghai（UTC+8 无夏令时），用 FixedZone 免依赖
+// 系统 tzdata（Windows 无 IANA 库时 LoadLocation 会失败）。
+var promoZone = time.FixedZone("CST", 8*3600)
+
+// promoClock 解析 "HH:MM" 为当日分钟数；坏值返回 (-1, false)。
+func promoClock(hhmm string) (int, bool) {
+	parts := strings.Split(hhmm, ":")
+	if len(parts) != 2 {
+		return -1, false
+	}
+	h, err1 := strconv.Atoi(strings.TrimSpace(parts[0]))
+	m, err2 := strconv.Atoi(strings.TrimSpace(parts[1]))
+	if err1 != nil || err2 != nil || h < 0 || h > 24 || m < 0 || m > 59 {
+		return -1, false
+	}
+	return h*60 + m, true
+}
+
+// promoActive 评估优惠在 now 是否生效：enabled + validFrom/validUntil 内 + 落在
+// 任一 daily 窗口（支持跨午夜，如 23:00→7:50）。schedule 为 nil 视为全天生效。
+func promoActive(p *v3ModelPromotion, now time.Time) bool {
+	if !p.Enabled {
+		return false
+	}
+	if sc := p.Schedule; sc != nil {
+		if sc.ValidFrom != "" {
+			from, err := time.Parse(time.RFC3339, sc.ValidFrom)
+			if err == nil && now.Before(from) {
+				return false
+			}
+		}
+		if sc.ValidUntil != "" {
+			until, err := time.Parse(time.RFC3339, sc.ValidUntil)
+			if err == nil && !now.Before(until) {
+				return false
+			}
+		}
+		if len(sc.Daily) > 0 {
+			cur := now.Hour()*60 + now.Minute()
+			inWindow := false
+			for _, w := range sc.Daily {
+				st, ok1 := promoClock(w.Start)
+				ed, ok2 := promoClock(w.End)
+				if !ok1 || !ok2 {
+					continue
+				}
+				if st <= ed {
+					if cur >= st && cur < ed {
+						inWindow = true
+						break
+					}
+				} else if cur >= st || cur < ed { // 跨午夜（23:00→7:50）
+					inWindow = true
+					break
+				}
+			}
+			if !inWindow {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// applyModelPromotions 把当前生效的优惠挂到目录条目：同模型多条命中取 priority
+// 最高（实测 glm-5.2 白天 badge-only(50) 与夜间五折(100) 靠 priority+daily 双轨
+// 切换）。无 discount 对象的条目也挂标签/说明（错峰类），PromoFactor 留 nil。
+func applyModelPromotions(out map[string]ModelInfo, promos []v3ModelPromotion) {
+	if len(promos) == 0 || len(out) == 0 {
+		return
+	}
+	now := time.Now().In(promoZone)
+	type cand struct {
+		prio int
+		p    *v3ModelPromotion
+	}
+	best := map[string]cand{}
+	for i := range promos {
+		p := &promos[i]
+		if !promoActive(p, now) {
+			continue
+		}
+		for _, id := range p.ModelIDs {
+			if _, ok := out[id]; !ok {
+				continue // 目录外模型（如同名 global 变体）不挂
+			}
+			if b, seen := best[id]; !seen || p.Priority > b.prio {
+				best[id] = cand{prio: p.Priority, p: p}
+			}
+		}
+	}
+	for id, c := range best {
+		mi := out[id]
+		if c.p.Badge != nil {
+			mi.PromoLabel = c.p.Badge.Label
+		}
+		if c.p.Hover != nil {
+			mi.PromoNote = c.p.Hover.TextZh
+		}
+		if c.p.Discount != nil {
+			f := c.p.Discount.Factor
+			mi.PromoFactor = &f
+			mi.PromoCredits = c.p.Discount.DiscountedCredits
+		}
+		out[id] = mi
+	}
 }
 
 // storeEfforts 按 realm 写入 effort 能力缓存桶（efforts + defaultEfforts），并发安全。
@@ -1326,6 +1580,71 @@ func (c *Client) storeEfforts(realm string, efforts map[string][]string, defs ma
 	c.defaultEfforts[k] = defs
 }
 
+// normalizeModelRate 把上游倍率原文规范化为可比较的数值键。
+// 兼容 "x0.05" / "x0.05 credits" / "0.50x" 等形态；无法数值化时保留去除
+// credits 后缀与空白后的原文，避免编造倍率。
+func normalizeModelRate(raw string) string {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return ""
+	}
+	if strings.HasSuffix(strings.ToLower(s), "credits") {
+		s = strings.TrimSpace(s[:len(s)-len("credits")])
+	}
+	if strings.HasPrefix(strings.ToLower(s), "x") {
+		s = strings.TrimSpace(s[1:])
+	} else if strings.HasSuffix(strings.ToLower(s), "x") {
+		s = strings.TrimSpace(s[:len(s)-1])
+	}
+	if s == "" {
+		return ""
+	}
+	v, err := strconv.ParseFloat(s, 64)
+	if err != nil {
+		return strings.TrimSpace(raw)
+	}
+	return strconv.FormatFloat(v, 'f', -1, 64)
+}
+
+// effectiveModelRate 返回模型当前生效倍率：有机器可读优惠时取折扣价，
+// 否则取牌价；两者均缺省时为空。
+func effectiveModelRate(mi ModelInfo) string {
+	if mi.PromoFactor != nil && strings.TrimSpace(mi.PromoCredits) != "" {
+		return normalizeModelRate(mi.PromoCredits)
+	}
+	return normalizeModelRate(mi.Credits)
+}
+
+// storeModelRates 按 realm 整体替换模型倍率快照。目录成功刷新但没有可解析
+// 倍率时写入空桶，使旧倍率不会继续冒充当前价。
+func (c *Client) storeModelRates(realm string, infos []ModelInfo) {
+	rates := make(map[string]string, len(infos))
+	for _, mi := range infos {
+		if mi.ID == "" {
+			continue
+		}
+		if rate := effectiveModelRate(mi); rate != "" {
+			rates[mi.ID] = rate
+		}
+	}
+	c.effortsMu.Lock()
+	defer c.effortsMu.Unlock()
+	if c.modelRates == nil {
+		c.modelRates = make(map[string]map[string]string)
+	}
+	c.modelRates[realmKey(realm)] = rates
+}
+
+// ModelRate 返回最近成功刷新的指定域模型生效倍率；未知返回空串。
+func (c *Client) ModelRate(realm, model string) string {
+	if c == nil || model == "" {
+		return ""
+	}
+	c.effortsMu.RLock()
+	defer c.effortsMu.RUnlock()
+	return c.modelRates[realmKey(realm)][model]
+}
+
 // GlobalEffortSnapshot 导出 global 域 effort 能力缓存（探测下发 ∪ 静态兜底合并后的桶），
 // 供 /v1/models 输出 reasoning_supported_efforts / reasoning_default_effort。
 // 返回副本；桶未填充（无 global 账号或从未探测）→ nil（调用方回落静态兜底表）。
@@ -1349,49 +1668,12 @@ func v3ConfigDomain(a *auth.Auth, chatBase string) string {
 	return "copilot.tencent.com"
 }
 
-// fetchV3ConfigModelMap 拉官方配置目录，按模型 id 建能力表——**两个 UA 各拉一次并取并集**。
-//
-// 该端点对 UA 敏感，且两种 UA 的目录**互补**（2026-09-20 实测，CN 与 global 同结论）：
-//
-//	IDE UA  (CodeBuddyIDE/…) 13-22 个：内部/工具族（auto-chat、o4-mini、nes/completion/
-//	                          codewise、hunyuan-image）+ 基础族（default/fast/balanced/
-//	                          primary/deep-model）
-//	CLI UA  (WorkBuddy/… CLI/…) 22-51 个：第三方模型族（glm / gpt / kimi / gemini /
-//	                          deepseek / hy3 / hy4…）
-//
-// 只探 IDE UA 会**整族漏掉第三方模型**——用户实测反馈"国际服有 deepseek-v4.1-flash（免费档）
-// 但模型列表里没有"，而该模型实际能调通（HTTP 200）。所以目录必须并集。
-//
-// 冲突（两边都有同名模型）时**保留 IDE 条目**：两边元数据各有更全之处（实测 auto：CLI
-// 256K / IDE 168K；deepseek-v4-flash：IDE 多一档 low），保留 IDE 等于维持既有显示与
-// 降级口径不变，本次改动只做"补缺"，不改已有数值。
-//
-// 单路失败不影响另一路（任一路成功即返回并集）；两路全失败才报错。
-func (c *Client) fetchV3ConfigModelMap(a *auth.Auth) (map[string]ModelInfo, error) {
-	ideMap, ideErr := c.fetchV3ConfigModelMapUA(a, codeBuddyIDEUA)
-	cliMap, cliErr := c.fetchV3ConfigModelMapUA(a, codeBuddyCLIUA)
-	switch {
-	case ideErr != nil && cliErr != nil:
-		return nil, fmt.Errorf("v3/config（IDE 与 CLI 两路都失败）: %v / %v", ideErr, cliErr)
-	case ideErr != nil:
-		log.Printf("WARN: [upstream] v3/config IDE UA 失败（仅用 CLI 目录）: %v", ideErr)
-		return cliMap, nil
-	case cliErr != nil:
-		log.Printf("WARN: [upstream] v3/config CLI UA 失败（仅用 IDE 目录）: %v", cliErr)
-		return ideMap, nil
-	}
-	// 并集：先放 IDE（冲突时它优先），再补 CLI 独有的模型。
-	for id, mi := range cliMap {
-		if _, ok := ideMap[id]; !ok {
-			ideMap[id] = mi
-		}
-	}
-	return ideMap, nil
-}
-
-// fetchV3ConfigModelMapUA 单路拉取 /v3/config（指定 UA），按模型 id 建能力表。
-// 版本号需随上游发版跟进：UA 过旧或形态不对（如只写 CodeBuddy/x.y.z）会拿到空目录或 400。
-func (c *Client) fetchV3ConfigModelMapUA(a *auth.Auth, ua string) (map[string]ModelInfo, error) {
+// fetchV3ConfigModelMap 拉官方配置目录（指定 UA），按模型 id 建能力表。
+// 该端点对 UA 敏感：必须带可识别的版本号（如 CodeBuddyIDE/x.y.z），否则 400
+// code=12403；且不同 UA 下发的模型集合**互补**（见 codeBuddyIDEUA / codeBuddyCLIUA
+// 注释）——调用方自行多路探测取并集（global 走三路、CN 走 IDE+CLI 两路）。
+// ua 为空串等价 codeBuddyIDEUA。
+func (c *Client) fetchV3ConfigModelMap(a *auth.Auth, ua string) (map[string]ModelInfo, error) {
 	req, err := http.NewRequest(http.MethodGet, c.chatBase(a)+"/v3/config", nil)
 	if err != nil {
 		return nil, err
@@ -1405,6 +1687,9 @@ func (c *Client) fetchV3ConfigModelMapUA(a *auth.Auth, ua string) (map[string]Mo
 	}
 	req.Header.Set("X-Domain", v3ConfigDomain(a, c.chatBase(a)))
 	req.Header.Set("X-Product", "SaaS")
+	if ua == "" {
+		ua = codeBuddyIDEUA
+	}
 	req.Header.Set("User-Agent", ua)
 	c.injectCodeBuddyRequest(req)
 	resp, err := c.HTTP.Do(req)
@@ -1424,6 +1709,18 @@ func (c *Client) fetchV3ConfigModelMapUA(a *auth.Auth, ua string) (map[string]Mo
 		Code int `json:"code"`
 		Data struct {
 			Models []dynModelEntry `json:"models"`
+			// 试用模型横幅：上游把「N 天免费试用」的模型放在这里，**不在 data.models 里**。
+			// 实测 global 侧 hy4-preview-f 只出现在此（modelId=hy4-preview-f、
+			// targetModelId=hy4-preview、trialDays=14），纯 data.models 解析会漏掉它。
+			ProductFeaturesConfig struct {
+				ModelTrialBanner struct {
+					Banners []struct {
+						ModelID       string `json:"modelId"`
+						TargetModelID string `json:"targetModelId"`
+					} `json:"banners"`
+				} `json:"ModelTrialBanner"`
+			} `json:"productFeaturesConfig"`
+			ModelPromotions []v3ModelPromotion `json:"modelPromotions"`
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(raw, &env); err != nil {
@@ -1439,6 +1736,40 @@ func (c *Client) fetchV3ConfigModelMapUA(a *auth.Auth, ua string) (map[string]Mo
 		}
 		out[m.ID] = m.modelInfo()
 	}
+	// 补入试用横幅模型（ModelTrialBanner）：上游把「N 天免费试用」的模型只放在这里，
+	// data.models 里没有，故纯目录解析会漏（实测 global 侧 hy4-preview-f 即如此，
+	// 但该模型**实际可调用**）。
+	//
+	// 元数据口径：能力字段（context/maxTokens/efforts/reasoning 等）从 targetModelId
+	// 的既有条目继承——试用版与其转正目标是同族模型，能力应当一致；
+	// 但 **Credits 与 Tags 显式清空**——它们描述的是"转正后"的计费与营销信息
+	// （如 hy4-preview 的 x0.29 与 badge），用在免费试用版上会误导下游展示。
+	//
+	// firstUseTimeKey / trialDays 属**账号级**试用状态，不透出给下游。
+	for _, b := range env.Data.ProductFeaturesConfig.ModelTrialBanner.Banners {
+		id := strings.TrimSpace(b.ModelID)
+		if id == "" {
+			continue
+		}
+		if _, exists := out[id]; exists {
+			continue
+		}
+		mi := ModelInfo{ID: id}
+		if tgt := strings.TrimSpace(b.TargetModelID); tgt != "" {
+			if base, ok := out[tgt]; ok {
+				mi = base
+				mi.ID = id
+			}
+		}
+		mi.Credits = ""
+		mi.Tags = nil
+		out[id] = mi
+	}
+	// 挂当前生效的限时优惠（modelPromotions）：Credits 字段是**牌价**（转正后基准
+	// 倍率，如 hy4-preview-f 的 x0.29），而 WorkBuddy 客户端显示的是生效价（试用/
+	// 折扣窗口内 factor 打折）——面板据此展示「生效价 + 标签 + 牌价」。
+	applyModelPromotions(out, env.Data.ModelPromotions)
+
 	if len(out) == 0 {
 		return nil, fmt.Errorf("v3/config returned empty models")
 	}
@@ -1458,9 +1789,12 @@ type CreditPackage struct {
 	Remain int64  `json:"remain"`
 	Used   int64  `json:"used"`
 	Size   int64  `json:"size"`
-	// EndTime 该包的可抵扣窗口结束时刻（DeductionEndTime 优先，CycleEndTime 兜底；
-	// 字段名坑见 expiring.go）。RFC3339 或上游墙钟串；空 = 长期包 / 上游未给。
+	// EndTime 该包的失效时刻：优先 DeductionEndTime（可抵扣窗口结束，真「用不完
+	// 就没了」），缺失依次回落 ExpiredTime / PackageEndTime / CycleEndTime（周期
+	// 边界，仅兜底）。RFC3339 或上游墙钟字符串，前端取日期部分展示。
 	EndTime string `json:"end_time,omitempty"`
+	// ExpiresAt 与 EndTime 同源的 Unix 毫秒时间戳，供面板按精确剩余天数聚合。
+	ExpiresAt int64 `json:"expires_at,omitempty"`
 	// CreatedAt 发放时刻，RFC3339。**这是区分「首登赠送」与「活动奖励」的唯一依据**：
 	// 两类包的 PackageName 与 PackageCode 完全相同（例如都是「国内运营裂变包」+
 	// TCACA_code_007_*），只看名字无法区分，只有时间能说明它是不是账号首次授权那刻发的。
@@ -1506,14 +1840,14 @@ func (c *Client) CreditPackages(a *auth.Auth) ([]CreditPackage, int64, int64, er
 					CycleCapacityRemain int64  `json:"CycleCapacityRemain"`
 					CycleCapacityUsed   int64  `json:"CycleCapacityUsed"`
 					CycleCapacitySize   int64  `json:"CycleCapacitySize"`
-					// 到期字段名坑（与 expiring.go 同源，见该文件头注释）：响应里
-					// ExpiredTime 恒为空串、PackageEndTime 不存在——真正可用的是
-					// DeductionEndTime（epoch 毫秒，可抵扣窗口结束）与 CycleEndTime
-					// （墙钟字符串，周期边界兜底）。旧两名保留为最后兜底（防御）。
-					DeductionEndTime int64  `json:"DeductionEndTime"`
-					CycleEndTime     string `json:"CycleEndTime"`
+					// 到期时间字段名在上游存在多种口径（CN/global 实测 ExpiredTime /
+					// PackageEndTime 恒 miss）：真实下发的是 CycleEndTime（周期边界）
+					// 与 DeductionEndTime（可抵扣窗口结束，epoch 毫秒）。三者都读，
+					// 真失效时刻以 DeductionEndTime 为准（见下方 switch 与 expiring.go）。
 					ExpiredTime      string `json:"ExpiredTime"`
 					PackageEndTime   string `json:"PackageEndTime"`
+					CycleEndTime     string `json:"CycleEndTime"`
+					DeductionEndTime int64  `json:"DeductionEndTime"`
 					// 发放时刻（epoch 毫秒）。
 					CreateTime     int64  `json:"CreateTime"`
 					PackageCode    string `json:"PackageCode"`
@@ -1536,17 +1870,25 @@ func (c *Client) CreditPackages(a *auth.Auth) ([]CreditPackage, int64, int64, er
 			SubProductCode: p.SubProductCode,
 			SubProductName: p.SubProductName,
 		}
-		// 到期时刻：与 expiring.go 同口径——DeductionEndTime 优先（这才是「用不完
-		// 就没了」的时刻），CycleEndTime 兜底，旧字段最后。全空 = 长期包（前端显示 —）。
+		// 到期时刻：优先 DeductionEndTime（可抵扣窗口结束，真「用不完就没了」；
+		// ExpiresAt 直接用原始毫秒——RFC3339 不是 packageEndLayout 形态，交给下方
+		// 解析会静默失败得 0），缺失依次回落 ExpiredTime / PackageEndTime /
+		// CycleEndTime（周期边界兜底）。全空 = 长期包（前端显示 —）。
 		switch {
 		case p.DeductionEndTime > 0:
 			cp.EndTime = time.UnixMilli(p.DeductionEndTime).Format(time.RFC3339)
-		case p.CycleEndTime != "":
-			cp.EndTime = p.CycleEndTime
+			cp.ExpiresAt = p.DeductionEndTime
 		case p.ExpiredTime != "":
 			cp.EndTime = p.ExpiredTime
-		default:
+		case p.PackageEndTime != "":
 			cp.EndTime = p.PackageEndTime
+		default:
+			cp.EndTime = p.CycleEndTime
+		}
+		if cp.ExpiresAt == 0 && cp.EndTime != "" {
+			if end, perr := time.ParseInLocation(packageEndLayout, cp.EndTime, softRateResetLoc); perr == nil {
+				cp.ExpiresAt = end.UnixMilli()
+			}
 		}
 		// CreateTime 是 epoch 毫秒；0 表示上游没给，留空而不是伪造 1970。
 		if p.CreateTime > 0 {
@@ -1586,6 +1928,19 @@ func (c *Client) UserResource(a *auth.Auth) (remain, total int64, err error) {
 // packageEndLayout 上游套餐到期时间的墙钟格式（UTC+8，与 softRateResetLoc 同口径）。
 const packageEndLayout = "2006-01-02 15:04:05"
 
+// parsePackageEndTime 统一解析上游套餐到期时间。空值、格式异常返回 false，
+// 调用方据此保守地不把该包计入最早到期路由。
+func parsePackageEndTime(raw string) (time.Time, bool) {
+	if raw == "" {
+		return time.Time{}, false
+	}
+	t, err := time.ParseInLocation(packageEndLayout, raw, softRateResetLoc)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return t, true
+}
+
 // UserResourceDetailed 在 UserResource 基础上额外返回「快过期」积分子集：
 // soon > 0 且套餐 CycleEndTime 解析成功且到期时刻 ≤ now+soon 的余额计入 expiring
 // （pool 据此优先消耗，避免官方活动赠送的奖励积分到期作废）；soon ≤ 0 时 expiring
@@ -1599,6 +1954,14 @@ const packageEndLayout = "2006-01-02 15:04:05"
 // 钳 [0,size] 与 used 修正；消除双份逻辑漂移——旧中间 switch 只钳负值，上游脏数据
 // CycleRemain>Size 时会高估）。
 func (c *Client) UserResourceDetailed(a *auth.Auth, soon time.Duration) (remain, total, expiring int64, err error) {
+	remain, total, expiring, _, _, err = c.UserResourceDetailedWithExpiry(a, soon)
+	return remain, total, expiring, err
+}
+
+// UserResourceDetailedWithExpiry 在 UserResourceDetailed 基础上返回最早未来到期批次：
+// earliestAt 是最早的可用到期时刻，earliestRemaining 是同一时刻所有正余额包的剩余量之和。
+// 已过期、剩余为 0、缺少或无法解析到期时间的包都不会成为最早批次；无有效批次时返回零值。
+func (c *Client) UserResourceDetailedWithExpiry(a *auth.Auth, soon time.Duration) (remain, total, expiring int64, earliestAt time.Time, earliestRemaining int64, err error) {
 	now := time.Now()
 	body := map[string]any{
 		"PageNumber":               1,
@@ -1608,9 +1971,16 @@ func (c *Client) UserResourceDetailed(a *auth.Auth, soon time.Duration) (remain,
 		"PackageEndTimeRangeBegin": now.Format(packageEndLayout),
 		"PackageEndTimeRangeEnd":   now.Add(365 * 101 * 24 * time.Hour).Format(packageEndLayout),
 	}
-	data, err := c.billingMeterJSON(a, c.billingMeterPaths(a), http.MethodPost, body)
+	// 余额查询同样做瞬时错误有界重试（签到后紧接着的 user-resource 偶发 500 会让
+	// 该账号错过本次解冻/到期快照更新，只能等下一个刷新周期）。
+	var data json.RawMessage
+	err = c.retryBillingTransient(func() error {
+		var e error
+		data, e = c.billingMeterJSON(a, c.billingMeterPaths(a), http.MethodPost, body)
+		return e
+	})
 	if err != nil {
-		return 0, 0, 0, err
+		return 0, 0, 0, time.Time{}, 0, err
 	}
 	var resp struct {
 		Response struct {
@@ -1629,7 +1999,7 @@ func (c *Client) UserResourceDetailed(a *auth.Auth, soon time.Duration) (remain,
 		} `json:"Response"`
 	}
 	if err := json.Unmarshal(data, &resp); err != nil {
-		return 0, 0, 0, fmt.Errorf("resource parse: %w", err)
+		return 0, 0, 0, time.Time{}, 0, fmt.Errorf("resource parse: %w", err)
 	}
 	for _, acct := range resp.Response.Data.Accounts {
 		r, _, size := packageRemainUsed(respAccount{
@@ -1648,16 +2018,25 @@ func (c *Client) UserResourceDetailed(a *auth.Auth, soon time.Duration) (remain,
 		}
 		remain += r
 		total += size
-		// 分桶：仅 soon>0 且能解析出有效到期时间、且确实在窗口内 → expiring。
-		if soon > 0 && r > 0 && acct.CycleEndTime != "" {
-			if end, perr := time.ParseInLocation(packageEndLayout, acct.CycleEndTime, softRateResetLoc); perr == nil {
-				if !end.After(now.Add(soon)) {
-					expiring += r
-				}
-			}
+		if r <= 0 {
+			continue
+		}
+		end, ok := parsePackageEndTime(acct.CycleEndTime)
+		if !ok || !end.After(now) {
+			continue
+		}
+		if earliestAt.IsZero() || end.Before(earliestAt) {
+			earliestAt = end
+			earliestRemaining = r
+		} else if end.Equal(earliestAt) {
+			earliestRemaining += r
+		}
+		// 分桶：仅 soon>0 且确实在窗口内 → expiring。
+		if soon > 0 && !end.After(now.Add(soon)) {
+			expiring += r
 		}
 	}
-	return remain, total, expiring, nil
+	return remain, total, expiring, earliestAt, earliestRemaining, nil
 }
 
 // respAccount 供 packageRemainUsed 解析的套餐字段（CreditPackages 的逐包结构同构）。
@@ -1702,9 +2081,13 @@ func packageRemainUsed(a respAccount) (remain, used, size int64) {
 }
 
 // DailyCheckin 执行每日签到。已签到（业务 code 非 0）也返回错误，调用方按 msg 区分。
+// 偶发上游 5xx（code 10000）做有界重试（见 retryBillingTransient）——单次抖动不再
+// 让该账号整天漏签；「已签到」等业务错误不重试。
 func (c *Client) DailyCheckin(a *auth.Auth) error {
-	_, err := c.billingMeterJSON(a, c.checkinMeterPaths(a), http.MethodPost, map[string]any{})
-	return err
+	return c.retryBillingTransient(func() error {
+		_, err := c.billingMeterJSON(a, c.checkinMeterPaths(a), http.MethodPost, map[string]any{})
+		return err
+	})
 }
 
 // IsAlreadyCheckin 报告 err 是否表示"今天已签到"（上游幂等拒绝重复签到）。

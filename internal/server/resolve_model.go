@@ -16,8 +16,8 @@ import "strings"
 //
 // 裸名的域归属（重名模型两域都有时按此取舍）：
 //
-//	1. model_realm.pins[模型名]  逐模型钉死（面板模型页「重复模型」里逐个钉）
-//	2. model_realm.prefer        全局默认（面板模型页「默认域优先级」，缺省 cn）
+//  1. model_realm.pins[模型名]  逐模型钉死（面板模型页「重复模型」里逐个钉）
+//  2. model_realm.prefer        全局默认（面板模型页「默认域优先级」，缺省 cn）
 //
 // 缺省 cn 是刻意的：去前缀之前裸名就按 cn 解析，缺省值保持历史语义，老客户端零回归。
 //
@@ -46,9 +46,9 @@ type ModelRealmCatalog struct {
 // 调用方可在该域**没有可用账号**时回落到另一域（见 otherRealm）；硬指定（显式前缀 / 逐模型
 // 钉死 / 目录证明只有一域有）不回退：宁可直接报错，也不悄悄换域（换域意味着不同的额度口径）。
 //
-//	1. 显式前缀 "global:x" → 硬（客户端明确要的就是这个域）
-//	2. 裸名且目录证明只有一个域有它 → 硬（事实优先于偏好）
-//	3. 裸名两域都有（或一侧目录未知）→ pins 命中 → 硬；否则 prefer → 软
+//  1. 显式前缀 "global:x" → 硬（客户端明确要的就是这个域）
+//  2. 裸名且目录证明只有一个域有它 → 硬（事实优先于偏好）
+//  3. 裸名两域都有（或一侧目录未知）→ pins 命中 → 硬；否则 prefer → 软
 func resolveModelRealm(model, prefer string, pins map[string]string, cat ModelRealmCatalog) (realm, bare string, soft bool) {
 	if r, b, ok := parseModelPrefix(model); ok {
 		return r, b, false

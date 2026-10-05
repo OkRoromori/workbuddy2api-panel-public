@@ -1,6 +1,6 @@
 // global 模型目录探测：纯动态产出模型名及其窗口 / 能力元数据（v3-config-merge）。
 //
-// 探测两路并发：/v3/config（主路，IDE UA 完整能力版）+ 企业端点家族
+// 探测并发四路：/v3/config 的三种 UA（桌面端主路 + IDE + CLI）与企业端点家族
 // （/v2 → /console 补缺），并集 = v3 条目为主、企业端点补 v3 缺失的 id
 // （如 gpt-5.3-codex 只在 /v2 下发）。倍率字段（credits）虽随目录下发，但
 // 只透出展示，不注入 costTier、不参与选号。
@@ -81,7 +81,7 @@ var globalModelsProbePaths = []string{
 // 用途：请求侧做「域校准」——只有 global 有的模型（gpt-6-astra 等）必须强制走 global，
 // 不能被 model_realm 的默认域送去国服（否则上游回 11102 model service info not found）。
 // 未探测 / 缓存过期 → 返回 nil，调用方据此判定"目录未知"并保持原有解析
-//（关键：绝不为了解析域而触发探测，聊天请求不能被目录拉取阻塞）。
+// （关键：绝不为了解析域而触发探测，聊天请求不能被目录拉取阻塞）。
 func (c *Client) GlobalModelNamesCached() []string {
 	c.globalModels.Lock()
 	defer c.globalModels.Unlock()
@@ -151,6 +151,7 @@ func (c *Client) fetchGlobalModelsOnce(a *auth.Auth) (names []string, infos []Mo
 	if len(efforts) > 0 || len(defaults) > 0 {
 		c.storeEfforts("global", efforts, defaults)
 	}
+	c.storeModelRates("global", infos)
 
 	// 成功：探测结果去重。names/infos 均落缓存；倍率等选号敏感字段只透出展示，
 	// 不注入 costTier。
@@ -173,41 +174,54 @@ func (c *Client) fetchGlobalModelsOnce(a *auth.Auth) (names []string, infos []Mo
 	return merged, infos
 }
 
-// probeGlobalModels 发起一次 global 模型目录探测（v3-config-merge）：
-// /v3/config（主，IDE UA 完整能力版）与企业端点家族（/v2 → /console 兜底，补缺）
-// **并发**探测后并集合并。返回模型名列表（已合并、未再去重——去重在
+// probeGlobalModels 发起一次 global 模型目录探测（v3-config-merge + desktop-ua）：
+// /v3/config（三路 UA：桌面端主路 + IDE + CLI）与企业端点家族（/v2 → /console 兜底，
+// 补缺）**并发**探测后并集合并。返回模型名列表（已合并、未再去重——去重在
 // fetchGlobalModelsOnce）、全字段 ModelInfo（对象形态；窄表为 nil）及 effort
-// 能力桶（supportedEfforts/defaultEffort，可为空）。合并口径：v3 条目为主
-// （credits 等字段以 v3 为准），企业端点只补 v3 缺失的模型 id；去重 key =
-// 模型 id，输出顺序稳定。两路全失败才返回错误（等价原「家族端点全非 2xx」
-// 负缓存语义）；单路失败降级为另一路结果 + warn 日志，互不拖累。
+// 能力桶（supportedEfforts/defaultEffort，可为空）。
+//
+// 三路 UA 缺一不可（2026-10-02 实测，同一 global 账号）：
+//   - 桌面端 UA → 29 条：**唯一含 gpt-6-sol / gpt-6-luna / grok-4.7 / gemini-3.8-flash**
+//   - IDE UA    → 13 条：独有 o4-mini / enhance-1.0 / auto-chat
+//   - CLI UA    → 22 条：独有 deepseek 系列 / gpt-6-astra / kimi-k2.8-preview
+//
+// 桌面端 UA 为主路：它是项目 chat 路径实际使用的 UA（与客户端看到的目录同源），
+// 且实测在两路共有的模型上字段完整度不低于另两路（窗口/effort/credits 齐全）。
+// 合并口径：桌面端条目字段权威，IDE/CLI 只补桌面端缺失的模型 id；去重 key =
+// 模型 id，输出顺序稳定。全部 v3 路失败且企业端点也失败才返回错误；单路失败
+// 降级为其余路结果 + warn 日志，互不拖累。
 func (c *Client) probeGlobalModels(a *auth.Auth) (names []string, infos []ModelInfo, efforts map[string][]string, defaults map[string]string, err error) {
-	type probeResult struct {
-		names []string
-		infos []ModelInfo
-		err   error
-	}
-	v3Ch := make(chan probeResult, 1)
-	enterpriseCh := make(chan probeResult, 1)
-	go func() {
-		// v3 主路：复用 IDE UA 版 /v3/config 探测（chatBase 已按 realm 切 global base）。
-		byID, perr := c.fetchV3ConfigModelMap(a)
-		if perr != nil {
-			v3Ch <- probeResult{err: perr}
-			return
-		}
-		ids := make([]string, 0, len(byID))
-		outInfos := make([]ModelInfo, 0, len(byID))
-		for _, mi := range byID {
-			if nonChatModel(mi.ID, mi.MaxTokens, mi.Tags) {
-				continue
+	// probeV3 单次 /v3/config 探测（UA 参数化）。该端点对不同 UA 下发**不同模型集合**：
+	// 桌面端 / IDE / CLI 三路各有独有模型（见 probeGlobalModels 注释），故并发三路取并集。
+	probeV3 := func(ua string) chan probeResult {
+		ch := make(chan probeResult, 1)
+		go func() {
+			// chatBase 已按 realm 切 global base。
+			byID, perr := c.fetchV3ConfigModelMap(a, ua)
+			if perr != nil {
+				ch <- probeResult{err: perr}
+				return
 			}
-			ids = append(ids, mi.ID)
-			outInfos = append(outInfos, mi)
-		}
-		sort.Strings(ids) // map 迭代序随机，排序保输出稳定
-		v3Ch <- probeResult{names: ids, infos: outInfos}
-	}()
+			ids := make([]string, 0, len(byID))
+			outInfos := make([]ModelInfo, 0, len(byID))
+			for _, mi := range byID {
+				if nonChatModel(mi.ID, mi.MaxTokens, mi.Tags) {
+					continue
+				}
+				ids = append(ids, mi.ID)
+				outInfos = append(outInfos, mi)
+			}
+			sort.Strings(ids) // map 迭代序随机，排序保输出稳定
+			ch <- probeResult{names: ids, infos: outInfos}
+		}()
+		return ch
+	}
+	// 桌面端 UA（主路）：项目 chat 路径实际使用的 UA，与官方客户端看到的目录同源。
+	// 按账号 realm 生成（global → `WorkBuddy AI` 平台段），故必须传 a 而非用常量。
+	v3DesktopCh := probeV3(c.defaultWorkBuddyUAFor(a))
+	v3IDECh := probeV3(codeBuddyIDEUA)
+	v3CLICh := probeV3(codeBuddyCLIUA)
+	enterpriseCh := make(chan probeResult, 1)
 	go func() {
 		// 企业端点家族：/v2 首选 → /console 兜底（既有探活序，零回归）。
 		var lastErr error
@@ -222,8 +236,21 @@ func (c *Client) probeGlobalModels(a *auth.Auth) (names []string, infos []ModelI
 		}
 		enterpriseCh <- probeResult{err: lastErr}
 	}()
-	v3 := <-v3Ch
+	v3Desktop := <-v3DesktopCh
+	v3IDE := <-v3IDECh
+	v3CLI := <-v3CLICh
 	enterprise := <-enterpriseCh
+	// v3 三路自合并：桌面端路字段权威（主路），IDE/CLI 只补主路缺失的模型 id
+	// （只补 id，字段仍取自各自条目——主路没有该 id 时才轮到它们）。
+	// 逐路容错：全失败才带 err 进入下游降级判断，部分失败 warn 后继续。
+	v3 := mergeV3Routes([]struct {
+		label string
+		res   probeResult
+	}{
+		{"desktop-UA", v3Desktop},
+		{"IDE-UA", v3IDE},
+		{"CLI-UA", v3CLI},
+	})
 
 	if v3.err != nil && enterprise.err != nil {
 		// 两路全失败 → 负缓存语义（等价原家族端点全非 2xx）。
@@ -253,6 +280,52 @@ func (c *Client) probeGlobalModels(a *auth.Auth) (names []string, infos []ModelI
 	efforts = mergeEffortBuckets(v3Efforts, entEfforts)
 	defaults = mergeEffortDefaults(v3Defaults, entDefaults)
 	return names, infos, efforts, defaults, nil
+}
+
+// probeResult 单路模型目录探测结果（/v3/config 某 UA 路，或企业端点家族）。
+// infos 为对象形态条目（窄表探测为 nil），names 与之平行；err 非 nil 表示该路失败。
+type probeResult struct {
+	names []string
+	infos []ModelInfo
+	err   error
+}
+
+// mergeV3Routes 按优先级合并 /v3/config 多路 UA 探测结果：routes 必须**按权威
+// 顺序**传入（主路在前）。前序路的字段权威，后续路只补前序路缺失的模型 id
+// （条目字段仍取自其所属路——该 id 只有那一路知道）。
+//
+// 容错：全路失败才返回 err（取首路错误，与既有「v3 全失败」降级语义一致）；
+// 部分失败 warn 日志后用成功路继续，单路故障不拖垮整次探测。
+// 全路成功但并集为空时保留空结果（由调用方按「空列表 = 失败」处理）。
+func mergeV3Routes(routes []struct {
+	label string
+	res   probeResult
+}) probeResult {
+	var out probeResult
+	var firstErr error
+	nOK := 0
+	for _, r := range routes {
+		if r.res.err != nil {
+			log.Printf("WARN: [upstream] global models: v3/config %s probe failed: %v", r.label, r.res.err)
+			if firstErr == nil {
+				firstErr = r.res.err
+			}
+			continue
+		}
+		nOK++
+		if out.err != nil || (len(out.names) == 0 && len(out.infos) == 0) {
+			// 首个成功路：整体作为基底（字段权威）。
+			out = r.res
+			continue
+		}
+		// 后续成功路：只补缺失的 id。
+		mergedNames, mergedInfos := mergeGlobalCatalog(out.names, out.infos, r.res.names, r.res.infos)
+		out.names, out.infos = mergedNames, mergedInfos
+	}
+	if nOK == 0 {
+		return probeResult{err: firstErr}
+	}
+	return out
 }
 
 // extractEfforts 从条目列表抽取 effort 能力桶（supportedEfforts 数组优先；

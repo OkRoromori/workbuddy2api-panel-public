@@ -643,6 +643,9 @@ function dur(sec) {
 
 /* ── 密钥门 ───────────────────────────────────────────────────────── */
 function openKey() { $('keyVeil').classList.add('on'); setTimeout(() => $('keyInput').focus(), 60); }
+// 密钥输入框被包进独立 form（防 Chromium 把它和页面搜索框配成一个"账号密码表单"）。
+// 单输入框表单回车会触发隐式提交 → 页面重载，这里拦住；回车照常走下面的进入逻辑。
+{ const kf = $('keyForm'); if (kf) kf.addEventListener('submit', ev => ev.preventDefault()); }
 $('btnKey').onclick = async () => {
   const v = $('keyInput').value.trim();
   if (!v) return;
@@ -1948,7 +1951,8 @@ function renderAccounts(list) {
       cls = 'cool';
       const kind = bl > (s.cool_remaining_sec || 0) ? '熔断' : (s.cool_kind === 'hard_credit' ? '积分冷却' : '限流冷却');
       tag = '<span class="tag warn">' + kind + ' · ' + dur(cool) + '</span>' + realmTag;
-    } else tag = '<span class="tag ok">可用</span>' + realmTag;
+    } else if (s.paused) tag = '<span class="tag mute">已暂停选号</span>' + realmTag;
+    else tag = '<span class="tag ok">可用</span>' + realmTag;
     // 正在服务：在途 > 0。整行加 busy 类（绿条 + 淡绿底），一眼看出现在是谁在跑。
     const busy = (s.in_flight || 0) > 0;
     if (busy) cls = (cls ? cls + ' ' : '') + 'busy';
@@ -1987,6 +1991,9 @@ function renderAccounts(list) {
         (realmOf(s) === 'global'
           ? '<button class="xs" data-a="activate" data-u="' + esc(s.uid) + '" title="补地区 → 注册激活 → 领 trial 积分 → 刷新余额（国际服专有链路，可反复点）">激活</button>'
           : '') +
+        (s.paused
+          ? '<button class="xs primary" data-a="resume" data-u="' + esc(s.uid) + '">恢复选号</button>'
+          : '<button class="xs ghost" data-a="pause" data-u="' + esc(s.uid) + '" title="退出选号，但照常签到 / 活跃上报 / 保活 / 刷新余额">暂停选号</button>') +
         (frozen ? '<button class="xs primary" data-a="revive" data-u="' + esc(s.uid) + '">解冻</button>'
                 : '<button class="xs ghost" data-a="disable" data-u="' + esc(s.uid) + '">禁用</button>') +
         '<button class="xs ghost danger" data-a="remove" data-u="' + esc(s.uid) + '">移除</button>' +
@@ -2224,6 +2231,12 @@ $('accBody').addEventListener('click', async ev => {
     } else if (a === 'disable') {
       await api('accounts/' + encodeURIComponent(u) + '/disable', { method: 'POST' });
       toast('已禁用', 'ok');
+    } else if (a === 'pause') {
+      await api('accounts/' + encodeURIComponent(u) + '/pause', { method: 'POST' });
+      toast('已暂停选号（保号任务照常）', 'ok');
+    } else if (a === 'resume') {
+      await api('accounts/' + encodeURIComponent(u) + '/resume', { method: 'POST' });
+      toast('已恢复参与选号', 'ok');
 		} else if (a === 'remove') {
 			await api('accounts/' + encodeURIComponent(u) + '/remove', { method: 'POST' });
 			toast('已移除', 'ok');
@@ -4132,6 +4145,11 @@ const CFG_MAP = {
   sanitize_blacklist_fingerprints: ['features', 'sanitize_blacklist_fingerprints'],
   session_sticky_enabled: ['session_sticky', 'enabled'],
 };
+// 覆盖型配置字段：面板里的空值**照发空串**（后端把空串视为"清掉这条覆盖"），
+// 其余字段空值 = 不下发（沿用现值）。u42：user_agent / prompt_file 是覆盖项，
+// 用户清空它们必须真的生效，而不是被"跳过发送"悄悄保留旧值。
+const CLEARABLE_CFG = new Set(['user_agent', 'prompt_file']);
+
 function dig(obj, path) { return path.reduce((o, k) => (o == null ? undefined : o[k]), obj); }
 function put(obj, path, val) {
   let o = obj;
@@ -4168,7 +4186,8 @@ function collectConfig() {
     else if (el.type === 'number') { v = el.value.trim() === '' ? undefined : Number(el.value); }
     else {
       const raw = el.value.trim();
-      if (raw === '') v = undefined;
+      // 覆盖型字段空串照发（见 CLEARABLE_CFG）；其余空 = 不下发。
+      if (raw === '') v = CLEARABLE_CFG.has(name) ? '' : undefined;
       else if (name.endsWith('_hours')) v = raw.split(/[,，\s]+/).filter(Boolean).map(Number);
       else v = raw;
     }

@@ -141,26 +141,44 @@ func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
 			errTotal = int64(s.ErrCount)
 		}
 		e := &entry{
-			a:                &auth.Auth{UID: uid}, // placeholder，Add 时会换成完整凭证
-			credits:          s.Credits,
-			creditsTotal:     s.CreditsTotal,
-			creditsExpiring:  s.CreditsExpiring,
-			disabled:         s.Disabled,
-			reason:           s.Reason,
-			until:            s.Until,
-			coolKind:         s.CoolKind,
-			successCount:     s.SuccessCount,
-			errTotal:         errTotal,
-			lastErr:          s.LastErr,
-			lastSuccess:      s.LastSuccess,
-			tokenUsage:       s.TokenUsage,
-			softStreak:       s.SoftStreak,
-			sessionDeadFails: s.SessionDeadFails,
-			probeAt:          s.ProbeAt,
-			probeOK:          s.ProbeOK,
-			probeErr:         s.ProbeErr,
-			probeFails:       s.ProbeFails,
-			consecutiveFails: s.ConsecutiveFails,
+			a:                        &auth.Auth{UID: uid}, // placeholder，Add 时会换成完整凭证
+			credits:                  s.Credits,
+			creditsTotal:             s.CreditsTotal,
+			creditsExpiring:          s.CreditsExpiring,
+			creditsEarliestExpiry:    s.CreditsEarliestExpiry,
+			creditsEarliestRemaining: s.CreditsEarliestRemaining,
+			disabled:                 s.Disabled,
+			paused:                   s.Paused,
+			reason:                   s.Reason,
+			until:                    s.Until,
+			coolKind:                 s.CoolKind,
+			successCount:             s.SuccessCount,
+			errTotal:                 errTotal,
+			lastErr:                  s.LastErr,
+			lastSuccess:              s.LastSuccess,
+			lastCheckinDay:           s.LastCheckinDay,
+			tokenUsage:               s.TokenUsage,
+			softStreak:               s.SoftStreak,
+			sessionDeadFails:         s.SessionDeadFails,
+			consecutiveFails:         s.ConsecutiveFails,
+			probeAt:                  s.ProbeAt,
+			probeOK:                  s.ProbeOK,
+			probeErr:                 s.ProbeErr,
+			probeFails:               s.ProbeFails,
+		}
+		// 到期快照按当前时刻惰性清洗：已过期、零剩余或超出总余额的脏数据不恢复。
+		if e.creditsExpiring < 0 {
+			e.creditsExpiring = 0
+		}
+		if e.creditsExpiring > e.credits {
+			e.creditsExpiring = e.credits
+		}
+		if e.creditsEarliestRemaining < 0 || e.creditsEarliestRemaining > e.credits {
+			e.creditsEarliestRemaining = 0
+		}
+		if e.creditsEarliestRemaining == 0 || e.creditsEarliestExpiry.IsZero() || !now.Before(e.creditsEarliestExpiry) {
+			e.creditsEarliestExpiry = time.Time{}
+			e.creditsEarliestRemaining = 0
 		}
 		// 熔断器持久化恢复：breakerUntil 未过期才恢复（过期不复活），retryCount 仅在
 		// 熔断仍有效时保留（否则归零，不保留无用退避指数）。
@@ -181,7 +199,7 @@ func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
 				if e.modelCooldowns == nil {
 					e.modelCooldowns = map[string]modelCooldown{}
 				}
-				e.modelCooldowns[m] = modelCooldown{Until: mc.Until, ResetAt: mc.ResetAt, Reason: mc.Reason}
+				e.modelCooldowns[m] = modelCooldown{Until: mc.Until, ResetAt: mc.ResetAt, Reason: mc.Reason, AuditOnly: mc.AuditOnly}
 			}
 		}
 		// 成本账本：惰性过滤过期（modelCostTTL 外不恢复）+ 剔除结构破损条目
@@ -270,25 +288,29 @@ func (p *Pool) stateOverviewLocked() stateFile {
 	sf := stateFile{Accounts: map[string]stateAccount{}}
 	for uid, e := range p.byUID {
 		s := stateAccount{
-			Credits:          e.credits,
-			CreditsTotal:     e.creditsTotal,
-			Disabled:         e.disabled,
-			Reason:           e.reason,
-			Until:            e.until,
-			CoolKind:         e.coolKind,
-			SuccessCount:     e.successCount,
-			ErrTotal:         e.errTotal,
-			LastSuccess:      e.lastSuccess,
-			LastErr:          e.lastErr,
-			TokenUsage:       e.tokenUsage,
-			SoftStreak:       e.softStreak,
-			SessionDeadFails: e.sessionDeadFails,
-			ProbeAt:          e.probeAt,
-			ProbeOK:          e.probeOK,
-			ProbeErr:         e.probeErr,
-			ProbeFails:       e.probeFails,
-			ConsecutiveFails: e.consecutiveFails,
-			CreditsExpiring:  e.creditsExpiring,
+			Credits:                  e.credits,
+			CreditsTotal:             e.creditsTotal,
+			Disabled:                 e.disabled,
+			Paused:                   e.paused,
+			Reason:                   e.reason,
+			Until:                    e.until,
+			CoolKind:                 e.coolKind,
+			SuccessCount:             e.successCount,
+			ErrTotal:                 e.errTotal,
+			LastSuccess:              e.lastSuccess,
+			LastErr:                  e.lastErr,
+			LastCheckinDay:           e.lastCheckinDay,
+			TokenUsage:               e.tokenUsage,
+			SoftStreak:               e.softStreak,
+			SessionDeadFails:         e.sessionDeadFails,
+			ConsecutiveFails:         e.consecutiveFails,
+			ProbeAt:                  e.probeAt,
+			ProbeOK:                  e.probeOK,
+			ProbeErr:                 e.probeErr,
+			ProbeFails:               e.probeFails,
+			CreditsExpiring:          e.creditsExpiring,
+			CreditsEarliestExpiry:    e.creditsEarliestExpiry,
+			CreditsEarliestRemaining: e.creditsEarliestRemaining,
 		}
 		// 熔断截止：仅未过期才落盘（指针 nil 才能被 omitempty 真省略）。
 		if !e.breakerUntil.IsZero() && now.Before(e.breakerUntil) {
@@ -310,7 +332,7 @@ func (p *Pool) stateOverviewLocked() stateFile {
 				if s.ModelCooldowns == nil {
 					s.ModelCooldowns = map[string]stateModelCooldown{}
 				}
-				s.ModelCooldowns[m] = stateModelCooldown{Until: mc.Until, ResetAt: mc.ResetAt, Reason: mc.Reason}
+				s.ModelCooldowns[m] = stateModelCooldown{Until: mc.Until, ResetAt: mc.ResetAt, Reason: mc.Reason, AuditOnly: mc.AuditOnly}
 			}
 		}
 		// 成本账本：惰性过滤过期观测（modelCostTTL 外不写——陈旧价格不复活）。

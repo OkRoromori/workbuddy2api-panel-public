@@ -174,11 +174,11 @@ type respStreamAdapter struct {
 	mdl string
 }
 
-func (a *respStreamAdapter) Start()             { a.s.Start() }
+func (a *respStreamAdapter) Start()              { a.s.Start() }
 func (a *respStreamAdapter) Frame(p string) bool { return a.s.Frame(p) }
-func (a *respStreamAdapter) Finish(r string)    { a.s.Finish(r) }
-func (a *respStreamAdapter) IsFinished() bool   { return a.s.finished }
-func (a *respStreamAdapter) setFlush(f func())  { a.s.flush = f }
+func (a *respStreamAdapter) Finish(r string)     { a.s.Finish(r) }
+func (a *respStreamAdapter) IsFinished() bool    { return a.s.finished }
+func (a *respStreamAdapter) setFlush(f func())   { a.s.flush = f }
 
 // anthStreamAdapter 让 *anthropicStreamer 满足 frameTranslator。
 type anthStreamAdapter struct {

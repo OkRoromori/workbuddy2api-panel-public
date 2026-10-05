@@ -18,7 +18,9 @@ func (s *Scheduler) RunBlackcatNow() {
 		return
 	}
 	for _, st := range s.cfg.Pool.List() {
-		if st.Disabled {
+		// 暂停选号（paused）账号跳过：夜猫子补的是 glm-5.2 短对话，产生真实
+		// 对话流量——轮换让位的号不该在 23:00 又被拉出来发消息。
+		if st.Disabled || st.Paused {
 			continue
 		}
 		a := s.cfg.Pool.AuthByUID(st.UID)

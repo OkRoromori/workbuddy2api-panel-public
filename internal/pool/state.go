@@ -5,6 +5,7 @@ package pool
 import (
 	"log"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/OkRoromori/workbuddy2api-panel-public/internal/auth"
@@ -81,6 +82,7 @@ func (p *Pool) Revive(uid string) bool {
 		return false
 	}
 	e.disabled = false
+	e.paused = false // 解冻是全清：暂停选号一并解除
 	e.until = time.Time{}
 	e.coolKind = 0
 	e.reason = ""
@@ -94,11 +96,38 @@ func (p *Pool) Revive(uid string) bool {
 	return true
 }
 
-// reviveCoolingLocked 只清冷却（until/coolKind/reason/softStreak）并更新 credits，不动熔断器
-// （fails/retryCount/breakerUntil）。签到解冻走这里：签到成功只证明余额恢复与
-// billing 通道健康，不证明 chat 通道健康，熔断（连续 5xx 信号）不应被签到覆盖。
-// softStreak 属**冷却域**（与 until/coolKind 同域），故随冷却一并清零——与"解冻只清冷却
-// 不清熔断"的既有 C5 语义一致；硬冷却（CoolHard）本就不参与 streak，这里清的是历史软冷却累积。
+// Pause 暂停选号：账号退出选号候选，但**照常参与**签到 / 活跃上报 / 保活 / 余额刷新。
+// 与 Disable 的区别：不写 reason、不清冷却域、不重置任何计数——账号是「临时让位」
+// 而非「判死」，故无需重登或人工解冻，Resume 即可立刻恢复。
+// uid 不存在返回 false（供调用方区分"账号不存在"与"已暂停"）。
+func (p *Pool) Pause(uid string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e, ok := p.byUID[uid]
+	if !ok {
+		return false
+	}
+	p.pauseLocked(e)
+	return true
+}
+
+// Resume 解除暂停选号（幂等，对未暂停账号为空操作）。uid 不存在返回 false。
+func (p *Pool) Resume(uid string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e, ok := p.byUID[uid]
+	if !ok {
+		return false
+	}
+	p.resumeLocked(e)
+	return true
+}
+
+// reviveCoolingLocked 只解冻余额耗尽冷却（CoolHard 的 until/coolKind/reason）并更新
+// credits，不动熔断器（fails/retryCount/breakerUntil）、软限流退避（CoolSoft/softStreak）
+// 与模型级台账（modelCooldowns）——限流冷却的恢复证据是重置墙钟到期，不是余额恢复。
+// 签到/余额刷新解冻走这里：余额恢复只证明 billing 通道健康，不证明 chat 通道健康，
+// 熔断（连续 5xx 信号）与限流冷却均不应被余额刷新覆盖。
 // 调用方必须已持有 p.mu。
 func (p *Pool) ReenableIfCredits(uid string, remain, total int64) {
 	p.mu.Lock()
@@ -110,6 +139,11 @@ func (p *Pool) ReenableIfCredits(uid string, remain, total int64) {
 			e.credits = remain
 			e.creditsTotal = total
 		}
+		// ReenableIfCredits 只有聚合余额上下文；到期明细必须由 SetCreditsDetailed
+		// 重新写入，不能沿用旧窗口/旧批次的缓存。
+		e.creditsExpiring = 0
+		e.creditsEarliestExpiry = time.Time{}
+		e.creditsEarliestRemaining = 0
 		p.dirty.Store(true)
 	}
 }
@@ -154,7 +188,7 @@ func (p *Pool) NoteSuccess(uid string) {
 }
 
 // NoteModelCost 记录一次实测扣费观测，更新该 (账号, 模型) 的成本账本，并顺带
-// 扣减账号余额（credits/creditsExpiring）。credit 为上游 usage.credit（本次真实
+// 扣减账号余额（credits/creditsExpiring/最早到期批次）。credit 为上游 usage.credit（本次真实
 // 扣费=消耗量），tokens 为本次请求的 token 总数（prompt+completion，用于折算单位
 // 成本）。tokens<=0 时不记录：无法折算单价，记进去会污染账本。
 //
@@ -166,7 +200,7 @@ func (p *Pool) NoteSuccess(uid string) {
 // （运维据此知道"免费午餐结束了"），判定在写入口做、只看覆盖前值。
 //
 // credits 签到外回写：credit 是本次请求的**消耗量**，不是剩余余额。顺手扣减
-// credits 与 creditsExpiring，让选号余额因子随消耗实时收敛——旧口径只在签到
+// credits 与到期快照，让选号余额因子随消耗实时收敛——旧口径只在签到
 // （每天 09:00/21:00 两次）刷新，两次签到之间（最长 12h）高消耗号持续高权重直到
 // 打空撞 402；global 账号不签到，credits 曾是终身冻结。签到仍定期覆盖
 // （ReenableIfCredits/SetCreditsDetailed 以 authoritative 余额重置），扣减只是
@@ -194,9 +228,18 @@ func (p *Pool) NoteModelCost(uid, model string, credit float64, tokens int) {
 		e.credits -= d
 		if e.creditsExpiring > 0 {
 			if d > e.creditsExpiring {
-				d = e.creditsExpiring
+				e.creditsExpiring = 0
+			} else {
+				e.creditsExpiring -= d
 			}
-			e.creditsExpiring -= d
+		}
+		if e.creditsEarliestRemaining > 0 {
+			if d >= e.creditsEarliestRemaining {
+				e.creditsEarliestRemaining = 0
+				e.creditsEarliestExpiry = time.Time{}
+			} else {
+				e.creditsEarliestRemaining -= d
+			}
 		}
 	}
 	if e.modelCost == nil {
@@ -342,10 +385,23 @@ func (p *Pool) PickByUIDForModel(uid, model string) *auth.Auth {
 	if !e.healthyForModel(now, model) {
 		return nil
 	}
+	// 积分保底（粘性路径）：与 pick 的 floorBlocked 同判据——触底 + 收费即拦
+	// （判据含上游目录倍率兜底，realm 取账号所属域——粘性号已确定，无需外部传入）。
+	// 返回 nil 后 handler 侧解绑粘性（unbindSticky）走普通轮换换号，粘性号回血
+	// 后下次会话重新绑定。
+	// 日志频次：天然每请求至多一条——首次返回 nil 即解绑，后续轮转不再调入本路径
+	// （无需额外节流）；粘性续期中每个新请求一条，恰好是「余额仍在线下」的持续提醒。
+	if p.floorBlockedForRealmModel(e, model, e.a.Realm(), now) {
+		log.Printf("WARN: [pool] credit floor: sticky acct=%s model=%s credits=%d < floor=%d, unbind (paid model held out)",
+			logfmt.Label(e.a.UID, e.a.Nickname), model, e.credits, p.creditFloor)
+		return nil
+	}
 	if p.inFlightFull(e) {
 		return nil
 	}
 	e.lastUsed = now
+	p.pickSeq++
+	e.usedSeq = p.pickSeq
 	return e.a
 }
 
@@ -366,6 +422,8 @@ func (p *Pool) PickByUID(uid string) *auth.Auth {
 		return nil
 	}
 	e.lastUsed = now
+	p.pickSeq++
+	e.usedSeq = p.pickSeq
 	return e.a
 }
 
@@ -395,7 +453,9 @@ func (p *Pool) countsDetailedForRealm(realm string) (total, healthy, cooling, di
 		}
 		total++
 		switch {
-		case e.disabled:
+		case e.disabled || e.paused:
+			// paused（暂停选号）与 disabled 同样不可选，合并计入 disabled 类
+			//（/status 的「不可用」口径）；细粒度区分由 Status.Paused 透出。
 			disabled++
 		case !e.healthy(now):
 			cooling++
@@ -464,33 +524,41 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		// 每模型一行（modelCooldowns 内未到期的条目），多模型同时限流全部展示。
 		// 到期判据 = 该模型的独立冷却 until 未过；条件满足才输出，随到期自然消失，
 		// 普通软冷却（无模型级表）/硬冷却不产生台账（零回归）。
-		RateLimitedModels: p.rateLimitedModelsLocked(e, now),
-		Realm:             e.a.Realm(),
-		Nickname:          e.a.Nickname,
-		Credits:           e.credits,
-		CreditsTotal:      e.creditsTotal,
-		Cooling:           now.Before(e.until) || now.Before(e.breakerUntil),
-		Reason:            e.reason,
-		Disabled:          e.disabled,
-		SuccessCount:      e.successCount,
-		ErrTotal:          e.errTotal,
-		TokenUsage:        e.tokenUsage,
-		LastSuccessTime:   e.lastSuccess,
-		LastErrTime:       e.lastErr,
-		Until:             e.until,
-		SoftStreak:        e.softStreak,
-		ModelCosts:        p.modelCostsStatusLocked(e, now),
-		ConsecutiveFails:  e.consecutiveFails,
-		DegradeUntil:      e.degradeUntil,
-		InFlight:          int(e.inFlight.Load()),
-		BreakerFails:      e.fails,
-		BreakerUntil:      e.breakerUntil,
-		ProbeAt:           e.probeAt,
-		ProbeOK:           e.probeOK,
-		ProbeErr:          e.probeErr,
-		ProbeFails:        e.probeFails,
-		TodayChecked:      sameLocalDay(e.checkinAt, now),
-		LastCheckin:       e.checkinAt,
+		RateLimitedModels:        p.rateLimitedModelsLocked(e, now),
+		Realm:                    e.a.Realm(),
+		Nickname:                 e.a.Nickname,
+		Credits:                  e.credits,
+		CreditsTotal:             e.creditsTotal,
+		CreditsExpiring:          e.creditsExpiring,
+		CreditsEarliestExpiry:    e.creditsEarliestExpiry,
+		CreditsEarliestRemaining: e.creditsEarliestRemaining,
+		Cooling:                  now.Before(e.until) || now.Before(e.breakerUntil),
+		Reason:                   e.reason,
+		Disabled:                 e.disabled,
+		Paused:                   e.paused,
+		SuccessCount:             e.successCount,
+		ErrTotal:                 e.errTotal,
+		CheckinDone:              e.lastCheckinDay == now.Format("2006-01-02"),
+		TokenUsage:               e.tokenUsage,
+		LastSuccessTime:          e.lastSuccess,
+		LastErrTime:              e.lastErr,
+		Until:                    e.until,
+		SoftStreak:               e.softStreak,
+		ModelCosts:               p.modelCostsStatusLocked(e, now),
+		ConsecutiveFails:         e.consecutiveFails,
+		DegradeUntil:             e.degradeUntil,
+		InFlight:                 int(e.inFlight.Load()),
+		BreakerFails:             e.fails,
+		BreakerUntil:             e.breakerUntil,
+		// 本分支面板沿用的签到展示字段：TodayChecked 与 CheckinDone 同源（都从
+		// 持久化的 lastCheckinDay 派生，跨重启一致）；LastCheckin 为运行态时刻。
+		TodayChecked: e.lastCheckinDay == now.Format("2006-01-02"),
+		LastCheckin:  e.checkinAt,
+		// 验活观测（本分支特性）。
+		ProbeAt:    e.probeAt,
+		ProbeOK:    e.probeOK,
+		ProbeErr:   e.probeErr,
+		ProbeFails: e.probeFails,
 	}
 	if st.Disabled {
 		// 禁用账号透出禁用原因（运维看不到为什么死）。
@@ -498,34 +566,26 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 	}
 	if st.Cooling {
 		// 冷却剩余秒数（向上取整，避免 0 显示为已到期）。
-		st.CoolRemaining = int64(time.Until(e.until).Seconds() + 0.999)
-		if st.CoolRemaining < 0 {
-			st.CoolRemaining = 0
+		// 常规冷却（until）与熔断期（breakerUntil）可能只有其一在生效，
+		// 取仍在未来且更晚截止的那个，避免仅熔断期时误报 0 / unknown。
+		remaining := int64(0)
+		if now.Before(e.until) {
+			if r := int64(time.Until(e.until).Seconds() + 0.999); r > remaining {
+				remaining = r
+			}
 		}
-		st.CoolKind = e.coolKind.String()
+		if now.Before(e.breakerUntil) {
+			if r := int64(time.Until(e.breakerUntil).Seconds() + 0.999); r > remaining {
+				remaining = r
+				st.CoolKind = "breaker"
+			}
+		}
+		st.CoolRemaining = remaining
+		if st.CoolKind == "" {
+			st.CoolKind = e.coolKind.String()
+		}
 	}
 	return st
-}
-
-// sameLocalDay 两时刻是否同一个本地日（签到状态按本地日历日归位，与上游的
-// 「今天已签到」语义一致——上游按北京日历日重置）。
-func sameLocalDay(a, b time.Time) bool {
-	if a.IsZero() {
-		return false
-	}
-	ay, am, ad := a.Local().Date()
-	by, bm, bd := b.Local().Date()
-	return ay == by && am == bm && ad == bd
-}
-
-// NoteCheckin 记录一次签到确认（成功或幂等都算）。供 scheduler 与面板单号签到
-// 调用；消费方是 statusOf 的 TodayChecked/LastCheckin 派生。
-func (p *Pool) NoteCheckin(uid string) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if e, ok := p.byUID[uid]; ok {
-		e.checkinAt = time.Now()
-	}
 }
 
 // modelCostsStatusLocked 收集账号的有效成本台账行（P1-anti-monopoly 可观测性）。
@@ -580,8 +640,13 @@ func (p *Pool) rateLimitedModelsLocked(e *entry, now time.Time) []RateLimitedMod
 	for _, m := range models {
 		mc := e.modelCooldowns[m]
 		if !mc.Until.IsZero() && now.Before(mc.Until) {
+			kind := "rate_limit"
+			if strings.HasPrefix(mc.Reason, "11102") {
+				kind = "model_unavailable"
+			}
 			row := RateLimitedModel{
 				Model:  m,
+				Kind:   kind,
 				Until:  mc.Until,
 				Reason: mc.Reason,
 			}

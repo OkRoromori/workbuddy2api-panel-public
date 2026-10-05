@@ -34,7 +34,7 @@
 | 项 | 内容 |
 |---|---|
 | ① 更上游的源头 | [`Sliverkiss/workbuddy2api`](https://github.com/Sliverkiss/workbuddy2api)，作者 **Sliverkiss** —— 网关内核、协议适配、错误分类、提示词体系、账号池设计的出处，**它的 README 才是基础功能的权威文档** |
-| ② 原项目（本仓库直接基于） | [`linguo2625469/workbuddy2api-panel`](https://github.com/linguo2625469/workbuddy2api-panel)，作者 **linguo2625469** —— 在 ① 之上做出 **Web 管理面板与面板侧运维层**；**本仓库就是从它 fork 的**；基座 v1.11.0-panel（`b4245a8`），已吸收到 `b69d06e`（1.11.1-panel） |
+| ② 原项目（本仓库直接基于） | [`linguo2625469/workbuddy2api-panel`](https://github.com/linguo2625469/workbuddy2api-panel)，作者 **linguo2625469** —— 在 ① 之上做出 **Web 管理面板与面板侧运维层**；**本仓库就是从它 fork 的**；基座 v1.11.0-panel（`b4245a8`），已吸收到 `ea3a51c`（1.11.11-panel，2026-10-05） |
 | ③ 本仓库 | [`OkRoromori/workbuddy2api-panel-public`](https://github.com/OkRoromori/workbuddy2api-panel-public) —— ② 的增强分支，增量见下节 |
 | 许可 | 继承 MIT License，**三层版权声明都保留**（[LICENSE](LICENSE) 顶部三行 Copyright） |
 | 引用要求 | 再分发（源码或二进制）时保留 ① 与 ② 的 MIT 版权与许可声明，并注明原始出处 `https://github.com/Sliverkiss/workbuddy2api` |
@@ -120,12 +120,13 @@
 
 ### 与 ② 原项目的同步状态
 
-本分支以 ② 的 `v1.11.0-panel`（`b4245a8`，2026-09-19）为基座，**已吸收 ② 到 `v1.11.1-panel`（`b69d06e`，2026-09-20）的全部修复**：
+本分支以 ② 的 `v1.11.0-panel`（`b4245a8`，2026-09-19）为基座，**已吸收 ② 到 `v1.11.11-panel`（`ea3a51c`，2026-10-05）的全部修复**：
 
 | ② 的提交 | 内容 | 本分支 |
 |---|---|---|
+| `ea3a51c`（10-05） | **115 个提交的大同步（1.11.1 → 1.11.11+）**：号池「暂停选号」paused / 积分保底 credit_floor / 倍率表启动预热；服务端模型级阻塞口径、吐字速率扣首字、入站读取上限可配、bad_params 归请求级 400、reqlog 请求归档（新包）；上游适配 GPT 系 max_tokens 下限、国际服多路 UA 目录探测、tool_pairing/profile 增强；CI（`.github/workflows`：推送测试 + 五平台编译，打 tag 自动发 Release） | **已吸收**（Go 侧全部 + 配套测试）。面板前端保留本分支 iOS 版，只吸收逻辑修复（覆盖型配置可清空、密钥输入框独立表单防凭据配对、账号行暂停/恢复选号按钮）；② 移除的开学季任务扫描已跟随（活动期 09-13~09-24 已结束；券码查询保留） |
 | `08752df`（09-20） | `fix(panel)`: run_queue 建队合并 mp 口径待办——修「扫描显示待办但执行队列报无可执行」 | **已吸收**。把扫描与执行队列两处口径收成一个 `mergeMPPending`（同一份实现，不再各写一遍），并补回归测试 `internal/panel/taskcenter_test.go`：去掉调用即复现原症状「无可执行待办（全部账号任务已完成）」 |
-| `b69d06e`（09-20） | 版本号 1.11.1-panel | 已跟随：`appVersion = "1.11.1-panel-main"`——数字部分表示已吸收 ② 1.11.1 的全部修复；后缀 `-main` 是本分支这条线的标记（面板标题显示的就是它，打开面板就知道跑的是哪一份） |
+| `b69d06e`（09-20） | 版本号 1.11.1-panel | 已跟随：`appVersion = "1.11.11-panel-main"`——数字部分表示已吸收 ② 1.11.11 的全部修复；后缀 `-main` 是本分支这条线的标记（面板标题显示的就是它，打开面板就知道跑的是哪一份） |
 
 > 注：本分支在若干点上与 ② 走的是**不同实现**（如大小上限：② 走"移除预拦截、交给上游自然响应"，本分支走"整体读入 + 64 MiB 显式 413"；如模型名：② 下发前缀，本分支下发裸名）。这些不是"落后"，是分叉，见上文各自条目。
 

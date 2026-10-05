@@ -193,7 +193,9 @@ func hasKind(kinds []taskKind, k taskKind) bool {
 type fakeUpstream struct {
 	checkinCalls   atomic.Int32
 	refreshCalls   atomic.Int32
+	travelCalls    atomic.Int32
 	resourceRemain int64
+	resourceEnd    string
 }
 
 func (f *fakeUpstream) server() *httptest.Server {
@@ -205,11 +207,22 @@ func (f *fakeUpstream) server() *httptest.Server {
 		case strings.HasSuffix(r.URL.Path, "/get-user-resource"):
 			// remain 需 <= size（取数钳 [0,size]：脏数据 remain>size 会被钳到 size
 			// ——上游真实数据恒一致，实测 Cycle{17,482,500}）。
+			end := ""
+			if f.resourceEnd != "" {
+				end = `,"CycleEndTime":` + jsonString(f.resourceEnd)
+			}
 			w.Write([]byte(`{"code":0,"data":{"Response":{"Data":{"Accounts":[{"CycleCapacitySize":1000,"CycleCapacityRemain":` +
-				jsonI64(f.resourceRemain) + `,"CycleCapacityUsed":0}]}}}}`))
+				jsonI64(f.resourceRemain) + `,"CycleCapacityUsed":0` + end + `}]}}}}`))
 		case strings.HasSuffix(r.URL.Path, "/token/refresh"):
 			f.refreshCalls.Add(1)
 			w.Write([]byte(`{"code":0,"data":{"accessToken":"new","expiresIn":3600}}`))
+		case strings.HasSuffix(r.URL.Path, "/activity/growth/buddy/info"):
+			// 已领养（data.buddy 非空）：跳过领养前置，直接进旅行状态查询。
+			w.Write([]byte(`{"code":0,"data":{"buddy":{"id":1,"name":"cat"}}}`))
+		case strings.HasSuffix(r.URL.Path, "/activity/growth/buddy/travel/status"):
+			// daily_limit_reached=true：状态查询计一次调用即止，不发 depart/claim。
+			f.travelCalls.Add(1)
+			w.Write([]byte(`{"code":0,"data":{"state":"idle","daily_limit_reached":true}}`))
 		default:
 			http.Error(w, "not found", 404)
 		}
@@ -217,6 +230,11 @@ func (f *fakeUpstream) server() *httptest.Server {
 }
 
 func jsonI64(v int64) string {
+	b, _ := json.Marshal(v)
+	return string(b)
+}
+
+func jsonString(v string) string {
 	b, _ := json.Marshal(v)
 	return string(b)
 }
@@ -406,5 +424,273 @@ func TestRunBalanceRefreshNowUpdatesCreditsAndRevives(t *testing.T) {
 	// 禁用账号不参与：其 credits 保持 0（未被 UserResource 覆盖解冻）。
 	if st2, _ := p.Status("u2"); !st2.Disabled {
 		t.Errorf("u2 must stay disabled")
+	}
+}
+
+// TestNextWakeGrowthSlot growth 排程进候选 + 禁用退场（每日自动执行成长任务队列）。
+func TestNextWakeGrowthSlot(t *testing.T) {
+	s := New(Config{GrowthHours: []int{1}})
+	at, kinds := s.nextWake(time.Date(2026, 9, 27, 0, 10, 0, 0, time.Local))
+	hasGrowth := false
+	for _, k := range kinds {
+		if k == taskGrowth {
+			hasGrowth = true
+		}
+	}
+	if !hasGrowth || at.Hour() != 1 || at.Day() != 27 {
+		t.Fatalf("growth 槽位: at=%v kinds=%v（期望 09-27 01:00 含 taskGrowth）", at, kinds)
+	}
+	// 禁用后不进候选（其余 kind 为空 → nextWake 零值返回）
+	s2 := New(Config{GrowthHours: []int{1}, GrowthDisabled: true})
+	_, kinds2 := s2.nextWake(time.Date(2026, 9, 27, 0, 10, 0, 0, time.Local))
+	for _, k := range kinds2 {
+		if k == taskGrowth {
+			t.Fatal("禁用后 growth 仍在候选")
+		}
+	}
+}
+
+func TestRunBalanceRefreshReplacesExpirySnapshot(t *testing.T) {
+	end := time.Now().In(time.FixedZone("CST", 8*3600)).Add(24 * time.Hour).Format("2006-01-02 15:04:05")
+	f := &fakeUpstream{resourceRemain: 100, resourceEnd: end}
+	srv := f.server()
+	defer srv.Close()
+
+	p := pool.New("")
+	p.Add(&auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
+	p.SetCreditsDetailed("u1", 999, 999, 999, time.Now().Add(time.Hour), 999)
+
+	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
+	s := New(Config{Pool: p, Upstream: up, ExpiringSoonWindow: 7 * 24 * time.Hour})
+	s.RunBalanceRefreshNow()
+
+	st, _ := p.Status("u1")
+	if st.Credits != 100 || st.CreditsExpiring != 100 || st.CreditsEarliestRemaining != 100 || st.CreditsEarliestExpiry.IsZero() {
+		t.Fatalf("snapshot=%+v", st)
+	}
+
+	f.resourceEnd = ""
+	s.RunBalanceRefreshNow()
+	st, _ = p.Status("u1")
+	if st.CreditsExpiring != 0 || st.CreditsEarliestRemaining != 0 || !st.CreditsEarliestExpiry.IsZero() {
+		t.Fatalf("zero expiry refresh did not clear snapshot=%+v", st)
+	}
+}
+
+func TestSetExpiringSoonWindowClearsSnapshot(t *testing.T) {
+	p := pool.New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.SetCreditsDetailed("u1", 100, 100, 50, time.Now().Add(time.Hour), 50)
+	s := New(Config{Pool: p, ExpiringSoonWindow: 7 * 24 * time.Hour})
+
+	s.SetExpiringSoonWindow(24 * time.Hour)
+	if got := s.ExpiringSoonWindow(); got != 24*time.Hour {
+		t.Fatalf("window=%v want 24h", got)
+	}
+	st, _ := p.Status("u1")
+	if st.CreditsExpiring != 0 || st.CreditsEarliestRemaining != 0 {
+		t.Fatalf("window change did not clear snapshot=%+v", st)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// schedule.include_disabled_in_tasks：保号类四任务是否覆盖「已禁用」账号
+// ---------------------------------------------------------------------------
+
+// poolWithDisabledAccount 建一个两账号池：u1 可用、u2 被人工禁用（终态）。
+func poolWithDisabledAccount() *pool.Pool {
+	p := pool.New("")
+	p.Add(&auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
+	p.Add(&auth.Auth{UID: "u2", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
+	p.Disable("u2", "manual disable (test)")
+	return p
+}
+
+// TestRunCheckinSkipsDisabledByDefault 缺省（开关未开）下禁用账号不签到——锁定既有行为。
+func TestRunCheckinSkipsDisabledByDefault(t *testing.T) {
+	f := &fakeUpstream{resourceRemain: 500}
+	srv := f.server()
+	defer srv.Close()
+
+	p := poolWithDisabledAccount()
+	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
+	s := New(Config{Pool: p, Upstream: up, CheckinHours: []int{9, 21}, KeepaliveHours: []int{22}})
+
+	s.RunCheckinNow()
+	if got := f.checkinCalls.Load(); got != 1 {
+		t.Errorf("checkin calls=%d want 1（仅 u1；禁用号默认跳过）", got)
+	}
+}
+
+// TestRunCheckinIncludesDisabledWhenConfigured 开关打开后禁用账号也签到，
+// 但**不被解冻**（ReenableIfCredits 对 disabled 是 no-op），且**仍不参与选号**。
+func TestRunCheckinIncludesDisabledWhenConfigured(t *testing.T) {
+	f := &fakeUpstream{resourceRemain: 500}
+	srv := f.server()
+	defer srv.Close()
+
+	p := poolWithDisabledAccount()
+	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
+	s := New(Config{
+		Pool: p, Upstream: up,
+		CheckinHours:           []int{9, 21},
+		IncludeDisabledInTasks: true,
+	})
+
+	s.RunCheckinNow()
+	if got := f.checkinCalls.Load(); got != 2 {
+		t.Errorf("checkin calls=%d want 2（u1 + 禁用号 u2）", got)
+	}
+	if st, _ := p.Status("u2"); !st.Disabled {
+		t.Errorf("禁用号签到后不应被自动解冻: %+v", st)
+	}
+	// 选号侧不受本开关影响：禁用号依旧不可选。
+	if got := p.Pick(); got == nil || got.UID != "u1" {
+		t.Errorf("选号应仍只给 u1, got %+v", got)
+	}
+}
+
+// TestRunKeepaliveIncludesDisabledRenewsToken 开关打开后禁用账号也续期 token
+// （轮换用法下保持闲置号可用的关键）。
+func TestRunKeepaliveIncludesDisabledRenewsToken(t *testing.T) {
+	f := &fakeUpstream{}
+	srv := f.server()
+	defer srv.Close()
+
+	p := poolWithDisabledAccount()
+	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
+	s := New(Config{Pool: p, Upstream: up, IncludeDisabledInTasks: true})
+
+	s.RunKeepaliveNow()
+	if got := f.refreshCalls.Load(); got != 2 {
+		t.Errorf("refresh calls=%d want 2（含禁用号续期 token）", got)
+	}
+}
+
+// TestRunBalanceRefreshIncludesDisabledUpdatesCredits 开关打开后禁用账号的积分也被刷新
+// （面板据此判断下一个该启用谁），但不会被解冻。
+func TestRunBalanceRefreshIncludesDisabledUpdatesCredits(t *testing.T) {
+	f := &fakeUpstream{resourceRemain: 700}
+	srv := f.server()
+	defer srv.Close()
+
+	p := poolWithDisabledAccount()
+	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
+	s := New(Config{Pool: p, Upstream: up, IncludeDisabledInTasks: true})
+
+	s.RunBalanceRefreshNow()
+	st, _ := p.Status("u2")
+	if st.Credits != 700 {
+		t.Errorf("禁用号 credits=%d want 700（余额刷新应覆盖禁用号）", st.Credits)
+	}
+	if !st.Disabled {
+		t.Errorf("余额刷新不得解冻禁用号: %+v", st)
+	}
+}
+
+// TestSetIncludeDisabledInTasksHot setter 热更新立即生效（面板保存配置走这条路径）。
+func TestSetIncludeDisabledInTasksHot(t *testing.T) {
+	f := &fakeUpstream{resourceRemain: 500}
+	srv := f.server()
+	defer srv.Close()
+
+	p := poolWithDisabledAccount()
+	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
+	s := New(Config{Pool: p, Upstream: up})
+
+	s.RunCheckinNow()
+	if got := f.checkinCalls.Load(); got != 1 {
+		t.Fatalf("前置：缺省应只签 1 个，got %d", got)
+	}
+
+	s.SetIncludeDisabledInTasks(true)
+	s.RunCheckinNow()
+	if got := f.checkinCalls.Load(); got != 3 {
+		t.Errorf("热更新后 checkin calls=%d want 3（1 + u1 + u2）", got)
+	}
+}
+
+// TestPausedAccountStillRunsKeepaliveTasks 暂停选号的账号**照常参与**保号任务
+// （签到 / 保活 / 余额刷新）——这是「暂停选号」与「禁用」的核心区别，也是本功能
+// 的存在理由：轮换用法下让位的号仍需养着，否则积分断档、token 过期要重新登录。
+// 注意：**不开** IncludeDisabledInTasks——paused 不依赖那个全局开关。
+func TestPausedAccountStillRunsKeepaliveTasks(t *testing.T) {
+	f := &fakeUpstream{resourceRemain: 700}
+	srv := f.server()
+	defer srv.Close()
+
+	p := pool.New("")
+	p.Add(&auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
+	p.Add(&auth.Auth{UID: "u2", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
+	if !p.Pause("u2") {
+		t.Fatal("Pause 失败")
+	}
+	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
+	s := New(Config{Pool: p, Upstream: up}) // 有意不设 IncludeDisabledInTasks
+
+	s.RunCheckinNow()
+	if got := f.checkinCalls.Load(); got != 2 {
+		t.Errorf("checkin calls=%d want 2（暂停号也签到，且无需全局开关）", got)
+	}
+	s.RunKeepaliveNow()
+	if got := f.refreshCalls.Load(); got != 2 {
+		t.Errorf("refresh calls=%d want 2（暂停号也续期 token）", got)
+	}
+	s.RunBalanceRefreshNow()
+	if st, _ := p.Status("u2"); st.Credits != 700 {
+		t.Errorf("暂停号 credits=%d want 700（余额刷新应覆盖）", st.Credits)
+	}
+	// 保号任务不得改变暂停状态（签到解冻的是冷却，不是 paused）
+	if st, _ := p.Status("u2"); !st.Paused {
+		t.Errorf("保号任务后暂停状态应保持: %+v", st)
+	}
+	// 选号侧始终排除暂停号
+	if got := p.Pick(); got == nil || got.UID != "u1" {
+		t.Errorf("选号应只给 u1, got %+v", got)
+	}
+}
+
+// TestPausedVsDisabledTaskParticipation 固化二者对比：都退出选号，但禁用号默认
+// 跳过保号（除非开 include_disabled_in_tasks），暂停号**无条件**参与。
+func TestPausedVsDisabledTaskParticipation(t *testing.T) {
+	f := &fakeUpstream{resourceRemain: 700}
+	srv := f.server()
+	defer srv.Close()
+
+	p := pool.New("")
+	p.Add(&auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
+	p.Add(&auth.Auth{UID: "u2", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
+	p.Add(&auth.Auth{UID: "u3", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
+	p.Pause("u2")
+	p.Disable("u3", "manual disable (test)")
+
+	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
+	s := New(Config{Pool: p, Upstream: up}) // 全局开关有意保持关闭
+
+	s.RunCheckinNow()
+	// u1（正常）+ u2（暂停）签到；u3（禁用）跳过 ⇒ 2 次
+	if got := f.checkinCalls.Load(); got != 2 {
+		t.Errorf("checkin calls=%d want 2（正常 + 暂停参与；禁用跳过）", got)
+	}
+}
+
+
+// TestPausedSkipsTravel 暂停号不跑旅行任务：旅行会发起对话流量，与「让位」
+// 语义矛盾（合并 #113 时补的口径，与 blackcat / 成长队列同跳）。
+func TestPausedSkipsTravel(t *testing.T) {
+	f := &fakeUpstream{}
+	srv := f.server()
+	defer srv.Close()
+
+	p := pool.New("")
+	p.Add(&auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
+	p.Add(&auth.Auth{UID: "u2", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
+	p.Pause("u2")
+	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
+	s := New(Config{Pool: p, Upstream: up})
+
+	s.RunTravelNow()
+	if got := f.travelCalls.Load(); got != 1 {
+		t.Errorf("travel status calls=%d want 1（仅 u1；暂停号跳过）", got)
 	}
 }

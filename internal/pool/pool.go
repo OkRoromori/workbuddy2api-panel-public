@@ -42,20 +42,36 @@ type Pool struct {
 	degradeThreshold   int
 	degradeCooldown    time.Duration
 	degradeCooldownMax time.Duration
-	// 三因子加权调优（SetWeights 注入；默认值见 defaultIdle*）。
+	// creditFloor 积分保底（SetCreditFloor 注入；0 = 关闭，缺省即现状）。
+	// 账号 credits < floor 时不再参与选号——防止收费请求把余额打穿、连免费模型都
+	// 402 冷却到次日签到。签到回血（SetCreditsDetailed）越过 floor 即自动恢复。
+	// 全池触底且无免费模型可接时选号返回 nil（硬语义：宁 503 不打穿）。
+	// 收费与否的判据见 floorBlockedForModel：本地实测台账优先，缺失时用上游目录
+	// 倍率（modelRateOf 注入）兜底，避免「无观测的高价新模型」绕过保底。
+	creditFloor int64
+	// modelRateOf 按 (realm, 模型) 查上游目录积分倍率（"0.79" / "" = 未知）。
+	// 由 main 用 upstream.Client.ModelRate 注入——pool 不依赖 upstream 包（避免
+	// 循环依赖与分层破坏），nil 时倍率兜底不生效（退化为仅本地台账判定）。
+	// 仅在持 p.mu 时由 floorBlockedForModel 调用；回调不得反向调用 Pool 方法。
+	modelRateOf func(realm, model string) string
+	// 加权路由的闲置补偿调优（SetWeights 注入；默认值见 defaultIdle*）。
 	idleWeightPerHour float64
 	idleWeightMax     float64
-	// pickPriority 选号积分优先级的取向（SetPickPriority 注入）：
-	// high_credit = 高积分优先（历史默认口径）；low_credit = 低积分优先；
-	// expiring = 快到期积分优先。见 pick.go 的 weightOf。
+	// preferExpiring 最早到期优先路由开关（默认 true）。开启且快过期窗口内存在有效
+	// 批次时，选号在成本层内先按最早到期排序；关闭后只使用普通加权路由。
+	preferExpiring bool
+	// pickPriority 选号积分优先级的取向（SetPickPriority 注入，本分支特性）：
+	// high_credit = 高积分优先（默认，与上游口径一致）；
+	// low_credit = 低积分优先（小余额先消耗）；expiring = 快到期积分优先。
+	// 见 pick.go 的 weightOf。
 	pickPriority string
+	// probeThreshold 连续验活失败多少次才自动禁用（SetProbeThreshold 注入；默认 3）。
+	probeThreshold int
 	// maxInFlight 单账号最大在途请求数；0 = 不限（租约关闭）。
 	maxInFlight int
 	// maxInFlightGlobal global 域单账号在途上限分档（WAF 403 修复 P1-1：global 域
 	// WAF 风控更紧，压低并发）；0 = 未设置，回落 maxInFlight（不分档，零回归）。
 	maxInFlightGlobal int
-	// probeThreshold 连续验活失败多少次才自动禁用（SetProbeThreshold 注入；默认 3）。
-	probeThreshold int
 	// randInt64N 仅供测试注入确定性随机源；nil 时用 math/rand/v2 全局源。
 	// 生产代码不应设置此字段。
 	randInt64N func(n int64) int64
@@ -83,6 +99,7 @@ func New(stateFp string) *Pool {
 		breakerCooldownMax: defaultBreakerCooldownMax,
 		idleWeightPerHour:  defaultIdleWeightPerHour,
 		idleWeightMax:      defaultIdleWeightMax,
+		preferExpiring:     true,
 		pickPriority:       PickPriorityHighCredit,
 		degradeThreshold:   defaultDegradeThreshold,
 		degradeCooldown:    defaultDegradeCooldown,
@@ -165,7 +182,7 @@ func (p *Pool) CostExploreStatus() (events int64, last map[string]time.Time) {
 	return p.costExploreEvents, last
 }
 
-// SetWeights 注入三因子加权的闲置补偿参数。非正值保留原值（用默认）。
+// SetWeights 注入加权路由的闲置补偿参数。非正值保留原值（用默认）。
 func (p *Pool) SetWeights(idlePerHour, idleMax float64) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -177,8 +194,15 @@ func (p *Pool) SetWeights(idlePerHour, idleMax float64) {
 	}
 }
 
-// SetPickPriority 注入选号积分优先级的取向（main 从 config 解析后调用）。
-// 空/非法值回落高积分优先（PickPriorityHighCredit，历史默认口径）。
+// SetPreferExpiring 注入最早到期优先路由开关（main 从 config 解析后调用）。
+func (p *Pool) SetPreferExpiring(enabled bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.preferExpiring = enabled
+}
+
+// SetPickPriority 注入选号积分优先级的取向（main 从 config 解析后调用，本分支特性）。
+// 空/非法值回落高积分优先（PickPriorityHighCredit，与上游口径一致的默认）。
 func (p *Pool) SetPickPriority(v string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -213,6 +237,35 @@ func (p *Pool) SetDegrade(threshold int, cooldown, cooldownMax time.Duration) {
 	if cooldownMax > 0 {
 		p.degradeCooldownMax = cooldownMax
 	}
+}
+
+// CreditFloor 透出生效的积分保底值（/status 用）。0 = 关闭。
+func (p *Pool) CreditFloor() int64 {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.creditFloor
+}
+
+// SetCreditFloor 注入积分保底线（main 从 config 解析后调用）。
+// 0 = 关闭（缺省即现状，零回归）；负值非法保留原值（0）。
+// 语义见 Pool.creditFloor 字段注释。
+func (p *Pool) SetCreditFloor(n int64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if n >= 0 {
+		p.creditFloor = n
+	}
+}
+
+// SetModelRateOf 注入上游目录积分倍率查表（main 用 upstream.Client.ModelRate 装配）。
+// 供积分保底兜底判定「未实测过的模型是否收费」——本地台账无观测时，不能因为
+// 「没学过」就放行，否则高价新模型会把触底号一次性打穿（kimi-k3-1 实案：
+// 全池无观测 → 保底全部放行 → 两笔扣 111 分打穿到 0 并硬冷却到次日 04:00）。
+// fn 可为 nil（清注入）；回调只在持 p.mu 时被调用，不得反向调用 Pool 方法。
+func (p *Pool) SetModelRateOf(fn func(realm, model string) string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.modelRateOf = fn
 }
 
 // SetMaxInFlight 注入单账号最大在途请求数；0 = 不限。负值保留原值。

@@ -23,9 +23,9 @@ import (
 
 // ActivationStep 激活链路的一步结果（面板逐条展示）。
 type ActivationStep struct {
-	Name   string `json:"name"`              // 步骤名：注册激活 / trial 加油包 / 读取余额
-	OK     bool   `json:"ok"`                // 该步是否达到预期
-	Detail string `json:"detail,omitempty"`  // 人话说明（成功口径 / 失败原因）
+	Name   string `json:"name"`             // 步骤名：注册激活 / trial 加油包 / 读取余额
+	OK     bool   `json:"ok"`               // 该步是否达到预期
+	Detail string `json:"detail,omitempty"` // 人话说明（成功口径 / 失败原因）
 }
 
 // 领到积分后等待重读的间隔与次数：实测入账延迟在 1 秒量级，给 2 次机会（共约 3 秒），

@@ -42,6 +42,9 @@ type Snapshot struct {
 	// ModelRealmPins 逐模型钉死域（裸模型名 → "cn"|"global"），优先于 ModelRealmPrefer。
 	// 与 Keys 一样遵守 Store 后不可修改的约定。
 	ModelRealmPins map[string]string
+
+	// RecordClientInfo 请求日志是否记录调用来源（客户端 IP / UA）。
+	RecordClientInfo bool
 }
 
 // ClientKeys 返回网关鉴权用的密钥表。

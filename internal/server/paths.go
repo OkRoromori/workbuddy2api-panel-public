@@ -23,7 +23,7 @@ import (
 // 那比多写几行映射更糟。这里只认网关确实提供的那几条路径。
 // 注意：**只列 /v1 下面的端点**。`/status`、`/healthz`、`/panel/` 都是顶层路由，
 // 把 `/status` 放进来会被"补 /v1"的规则改成 `/v1/status`，反而把好路由打断
-//（第一次写时就踩了：TestStatusEndpoint 等四个测试全红）。
+// （第一次写时就踩了：TestStatusEndpoint 等四个测试全红）。
 var knownEndpoints = []string{
 	"/chat/completions",
 	"/responses",

@@ -10,12 +10,12 @@ import (
 // 而客户端仍可用显式前缀强制指定某域。
 func TestResolveModelWithRealm(t *testing.T) {
 	cases := []struct {
-		name          string
-		model         string
-		prefer        string
-		pins          map[string]string
-		wantRealm     string
-		wantBare      string
+		name      string
+		model     string
+		prefer    string
+		pins      map[string]string
+		wantRealm string
+		wantBare  string
 	}{
 		{"裸名缺省 → cn（去前缀前的历史语义）", "glm-5.3", "", nil, "cn", "glm-5.3"},
 		{"裸名 prefer=global", "glm-5.3", "global", nil, "global", "glm-5.3"},
@@ -82,8 +82,8 @@ func TestAssembleModelList(t *testing.T) {
 			"glm-5.3": newEntry("cn", "glm-5.3"),
 		}
 		global := map[string]map[string]any{
-			"glm-5.3":   newEntry("global", "glm-5.3"),
-			"gpt-5.5":   newEntry("global", "gpt-5.5"),
+			"glm-5.3": newEntry("global", "glm-5.3"),
+			"gpt-5.5": newEntry("global", "gpt-5.5"),
 		}
 		return cn, global, []string{"cn-only", "glm-5.3"}, []string{"glm-5.3", "gpt-5.5"}
 	}

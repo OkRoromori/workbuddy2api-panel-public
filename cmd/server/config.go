@@ -38,6 +38,37 @@ type Config struct {
 	// 与 api_keys 分开可保持旧的「密钥 → 名字」配置格式完全兼容。
 	APIKeyPolicies map[string]livecfg.KeyPolicy `json:"api_key_policies,omitempty"`
 
+	Panel struct {
+		// PackageDetailLimit 积分构成页单账号默认展示的最近到期包数；<=0 回落 5。
+		PackageDetailLimit int `json:"package_detail_limit"`
+	} `json:"panel"`
+
+	Logging struct {
+		// RequestArchiveEnabled 请求元数据 JSONL 归档开关，缺省 true。
+		RequestArchiveEnabled bool `json:"request_archive_enabled"`
+		// RequestRetentionDays 归档保留天数，缺省 7；<=0 回落默认。
+		RequestRetentionDays int `json:"request_retention_days"`
+		// RequestArchiveMaxMB 归档总上限（MiB），缺省 100；<=0 回落默认。
+		RequestArchiveMaxMB int `json:"request_archive_max_mb"`
+		// RequestClientInfo 是否在请求日志（归档事件 + stdout 流水行 + 面板运行
+		// 日志）里记录调用来源：客户端 IP 与 User-Agent。缺省 true。
+		//
+		// 为什么做成开关而不是恒开：来源信息是排查"谁在打网关"的第一手线索，
+		// 但它比 token 计数敏感（IP 属个人信息），共享部署/多租户场景可能需要
+		// 关掉。关闭后 Event.ClientIP/UserAgent 保持为空，归档里不出现该字段。
+		// 热生效（经 livecfg 快照），无需重启。
+		RequestClientInfo bool `json:"request_client_info"`
+	} `json:"logging"`
+
+	Server struct {
+		// ReadTimeout 入站请求读取（含 body 上传）总时长上限（issue #100）。
+		// http.Server 的 ReadTimeout 覆盖整个请求读取：大上下文/文件块请求经
+		// 反代链转发时上传可超过旧固定值 60s，被掐后客户端拿到
+		// 400 "read body: ... i/o timeout"。缺省 "300s"；"0" = 不限制
+		//（慢速 body 可无限占用连接，自担风险）；改动需重启进程。
+		ReadTimeout string `json:"read_timeout"` // "300s"；"0" = 不限制
+	} `json:"server"`
+
 	Cooldown struct {
 		// hard_credit / err_threshold / err_cooldown 三个历史键已退役：
 		// 硬冷却固定为次日 04:00（CooldownUntilTomorrow4AM），连续错误语义并入熔断器。
@@ -54,6 +85,7 @@ type Config struct {
 		ActivityHours  []int `json:"activity_hours"`  // [10]
 		KeepaliveHours []int `json:"keepalive_hours"` // [22]
 		BlackcatHours  []int `json:"blackcat_hours"`  // [23] 夜猫子窗口（23:00–08:00 计数）
+		GrowthHours    []int `json:"growth_hours"`    // [1] 成长任务队列（Sequential 族每日零点解锁，01:00 自动扫描执行）
 		// CheckinEnabled/TravelEnabled/ActivityEnabled/KeepaliveEnabled/BlackcatEnabled 显式禁用开关（缺省 true）。
 		//
 		// 为什么用独立 bool 而不是空数组/哨兵值表意"禁用"：
@@ -68,6 +100,23 @@ type Config struct {
 		ActivityEnabled  bool `json:"activity_enabled"`  // 缺省 true；false = 停活跃上报
 		KeepaliveEnabled bool `json:"keepalive_enabled"` // 缺省 true；false = 关 token 保活
 		BlackcatEnabled  bool `json:"blackcat_enabled"`  // 缺省 true；false = 关夜猫子
+		GrowthEnabled    bool `json:"growth_enabled"`    // 缺省 true；false = 关成长任务自动排程
+
+		// IncludeDisabledInTasks 让「保号类」定时任务（签到 / 活跃上报 / token 保活 /
+		// 余额刷新）对**已禁用（disabled）**的账号也执行。
+		//
+		// 为什么需要它：面板「禁用」的语义是「不再参与选号」（见面板确认文案），但这四类
+		// 任务此前一律 `if st.Disabled { continue }`，等于把「停用流量」放大成「停止一切
+		// 上游保号行为」——被禁用的号拿不到签到积分、不续 token、余额也不再刷新；而
+		// ReenableIfCredits 明确不复活 disabled 账号（见 pool.state.go），于是签到这条唯一
+		// 的自动回血路径也断了，账号只能靠人工「解冻」回来。
+		//
+		// 对「一次只放开一个号、用禁用做流量开关」的轮换用法（同 IP 多号防风控），闲置
+		// 待命的号恰恰是最需要签到的那批——本开关即为该用法提供出口。
+		//
+		// 缺省 false = 保持既有行为，对老配置零影响。打开后禁用号仍会签到 / 保活，但
+		// **依旧不参与选号**：pool 选号侧的 disabled 过滤不受本开关影响。
+		IncludeDisabledInTasks bool `json:"include_disabled_in_tasks"`
 
 		// 余额后台周期刷新：两次签到时点之间 credits 也能保持新鲜（面板/状态观测用）。
 		// 解冻语义同签到（余额 > 0 的冷却账号自动解冻），但不做签到不刷 token。
@@ -185,8 +234,14 @@ type Config struct {
 		//   "expiring"          = 快到期积分优先（先烧要作废的）。
 		// 空/未知值归一为 high_credit。改动热生效（面板保存后立即换向）。
 		PickPriority string `json:"pick_priority"`
+		// PreferExpiring 快过期积分加权开关，默认 true。开启且 expiring_soon 窗口内
+		// 存在有效批次时，该账号选号权重 ×3（虚拟实例，见 pool 路由加权）；
+		// 不按到期时间排序、与批次金额无关（issue #101 对齐实现口径）。
+		// 关闭后完全不使用到期信息选号。
+		PreferExpiring bool `json:"prefer_expiring"`
 		// ExpiringSoon 快过期积分窗口（如 "168h"=7天）：签到/余额刷新时，到期时间在
-		// 此窗口内的积分被标记为"快过期"，选号优先消耗。空/0 = 禁用分桶。
+		// 此窗口内的批次令账号命中上述 ×3 加权；窗口开大 → 命中账号变多、
+		// 偏好被稀释。空/0 = 禁用该加权门槛。
 		ExpiringSoon string `json:"expiring_soon"`
 		// CostExploreInterval costTier 条件探索窗口（issue #136 方案 a′）：tier 0
 		// 垄断层存在且 tier 1 有成员时，距上次探索 ≥ 窗口则本次 pick 生效层切
@@ -194,6 +249,11 @@ type Config struct {
 		// 错误策略）。默认 "30m"（≤48 次/天/模型）；"0" 关停（完全回到现状行为）；
 		// 空值回落默认。
 		CostExploreInterval string `json:"cost_explore_interval"`
+		// CreditFloor 积分保底：账号余额低于该值时，对实测收费模型（tier 2）不再
+		// 参与选号——防止收费请求把余额打穿、连免费模型都 402 冷却到次日签到。
+		// tier 0（免费）/ tier 1（无观测）不受限；签到回血越过 floor 自动恢复。
+		// 默认 0 = 关闭；负值钳 0。
+		CreditFloor int64 `json:"credit_floor"`
 	} `json:"pool"`
 
 	SessionSticky struct {
@@ -217,6 +277,8 @@ type Config struct {
 	CostExploreIntervalDur time.Duration `json:"-"`
 	// ProbeInterval 验活间隔（0 = 不启动，probe.enabled=false）。
 	ProbeInterval time.Duration `json:"-"`
+	// ServerReadTimeoutDur 解析后的入站请求读取上限（issue #100）；0 = 不限制。
+	ServerReadTimeoutDur time.Duration `json:"-"`
 }
 
 // Default 默认配置。
@@ -230,14 +292,24 @@ func Default() *Config {
 	c.APIKeyName = DefaultAPIKeyName
 	c.Cooldown.SoftRate = "600s"
 	c.Cooldown.SoftRateMax = "2h"
+	c.Server.ReadTimeout = "300s"
+	c.Panel.PackageDetailLimit = 5
+	c.Logging.RequestArchiveEnabled = true
+	c.Logging.RequestRetentionDays = 7
+	c.Logging.RequestArchiveMaxMB = 100
+	// 缺省 true 靠显式赋值实现（同 Schedule 开关）：JSON 里键缺席时字段保留此值，
+	// 只有显式 false 才关闭来源记录。
+	c.Logging.RequestClientInfo = true
 	c.Schedule.CheckinHours = []int{9, 21}
 	c.Schedule.TravelHours = []int{9, 21}
 	c.Schedule.ActivityHours = []int{10}
 	c.Schedule.KeepaliveHours = []int{22}
 	c.Schedule.BlackcatHours = []int{23}
+	c.Schedule.GrowthHours = []int{1}
 	// 开关「缺省 true」靠这几行实现：Load 先取 Default() 再 json.Unmarshal 覆盖，
 	// 键缺席（或为 null）时字段原样保留 true，只有显式 false 才关。
 	c.Schedule.CheckinEnabled = true
+	c.Schedule.GrowthEnabled = true
 	c.Schedule.TravelEnabled = true
 	c.Schedule.ActivityEnabled = true
 	c.Schedule.KeepaliveEnabled = true
@@ -274,6 +346,7 @@ func Default() *Config {
 	c.Pool.IdleWeightPerHour = 0.5
 	c.Pool.IdleWeightMax = 5.0
 	c.Pool.PickPriority = pool.PickPriorityHighCredit
+	c.Pool.PreferExpiring = true
 	c.Pool.ExpiringSoon = "168h" // 快过期窗口默认 7 天：官方活动奖励积分多在两周内过期
 	// costTier 探索默认 30m（issue #136：垄断破除 + 搭车改道零新增请求）；"0" 关停。
 	c.Pool.CostExploreInterval = "30m"
@@ -431,12 +504,37 @@ func applyEnv(c *Config) {
 	if v := os.Getenv("WB2A_EXPIRING_SOON"); v != "" {
 		c.Pool.ExpiringSoon = v
 	}
+	if v := os.Getenv("WB2A_PREFER_EXPIRING"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			c.Pool.PreferExpiring = b
+		}
+	}
 }
 
 func (c *Config) normalize() error {
 	var err error
 	if err = c.normalizeAPIKeys(); err != nil {
 		return err
+	}
+	if c.Panel.PackageDetailLimit <= 0 {
+		c.Panel.PackageDetailLimit = 5
+	}
+	if c.Logging.RequestRetentionDays <= 0 {
+		c.Logging.RequestRetentionDays = 7
+	}
+	if c.Logging.RequestArchiveMaxMB <= 0 {
+		c.Logging.RequestArchiveMaxMB = 100
+	}
+	// 入站读取上限（issue #100）：空值回落默认 300s；"0" 合法（不限制）；
+	// 负值无语义，fail fast（静默钳 0 会把保护悄悄关掉）。
+	if c.Server.ReadTimeout == "" {
+		c.Server.ReadTimeout = "300s"
+	}
+	if c.ServerReadTimeoutDur, err = time.ParseDuration(c.Server.ReadTimeout); err != nil {
+		return fmt.Errorf("server.read_timeout: %w", err)
+	}
+	if c.ServerReadTimeoutDur < 0 {
+		return fmt.Errorf("server.read_timeout: 负时长 %q 无意义", c.Server.ReadTimeout)
 	}
 	if c.SoftRateDur, err = time.ParseDuration(c.Cooldown.SoftRate); err != nil {
 		return fmt.Errorf("cooldown.soft_rate: %w", err)
@@ -472,6 +570,10 @@ func (c *Config) normalize() error {
 			return fmt.Errorf("pool.expiring_soon: %w", err)
 		}
 	}
+	if c.ExpiringSoonDur < 0 {
+		c.ExpiringSoonDur = 0
+		c.Pool.ExpiringSoon = "0"
+	}
 	// costTier 探索窗口（issue #136）：空值回落默认 30m（Default 已置；此兜底覆盖
 	// 显式 ""）；"0" 是合法值（关停，完全回到现状行为），不回落；负值钳 0 同关停
 	//（"−5m" 无合理语义）。
@@ -483,6 +585,10 @@ func (c *Config) normalize() error {
 	}
 	if c.CostExploreIntervalDur < 0 {
 		c.CostExploreIntervalDur = 0
+	}
+	// 积分保底：负值钳 0（= 关闭）。0 是合法默认（关闭），无需空值回落。
+	if c.Pool.CreditFloor < 0 {
+		c.Pool.CreditFloor = 0
 	}
 	if c.Pool.BreakerThreshold <= 0 {
 		c.Pool.BreakerThreshold = 3
@@ -564,6 +670,9 @@ func (c *Config) normalize() error {
 	if len(c.Schedule.BlackcatHours) == 0 {
 		c.Schedule.BlackcatHours = []int{23}
 	}
+	if len(c.Schedule.GrowthHours) == 0 {
+		c.Schedule.GrowthHours = []int{1}
+	}
 	// 余额后台刷新：启用时 minutes<=0 回落默认 5；关闭时 interval 保持 0（不启动）。
 	if c.Schedule.BalanceRefreshEnabled {
 		if c.Schedule.BalanceRefreshMinutes <= 0 {
@@ -642,7 +751,10 @@ func (c *Config) validateScheduleHours() error {
 	if err := checkHourRange("schedule.keepalive_hours", "keepalive_enabled", c.Schedule.KeepaliveHours); err != nil {
 		return err
 	}
-	return checkHourRange("schedule.blackcat_hours", "blackcat_enabled", c.Schedule.BlackcatHours)
+	if err := checkHourRange("schedule.blackcat_hours", "blackcat_enabled", c.Schedule.BlackcatHours); err != nil {
+		return err
+	}
+	return checkHourRange("schedule.growth_hours", "growth_enabled", c.Schedule.GrowthHours)
 }
 
 func checkHourRange(field, switchKey string, hours []int) error {

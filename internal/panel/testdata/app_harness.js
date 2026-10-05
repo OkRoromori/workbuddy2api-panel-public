@@ -577,7 +577,8 @@ eq((getEl('accBody').innerHTML.match(/<tr\b/g) || []).length, 1, '筛选后只�
 ok(getEl('accCount').textContent.includes('1 / 3'), '筛选后计数 1 / 3');
 T.setAccFilter('all');
 T.renderAccounts();
-ok(!getEl('accBody').innerHTML.includes('签到'), '账号表不再放签到按钮');
+ok(!getEl('accBody').innerHTML.includes('data-a="checkin"'), '账号表不再放签到按钮（精确到动作标记，title 里提「签到」不算）');
+ok(getEl('accBody').innerHTML.includes('data-a="pause"') || getEl('accBody').innerHTML.includes('data-a="resume"'), '账号表有暂停/恢复选号按钮');
 ok(!getEl('accBody').innerHTML.includes('任务'), '账号表不再放任务按钮');
 
 /* ── 4c. 签到积分页 ───────────────────────────────────────────────── */

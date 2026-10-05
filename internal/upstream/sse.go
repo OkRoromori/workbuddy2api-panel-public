@@ -159,7 +159,7 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 					// （6004 限流、内容拦截等，上游以 SSE error 帧下发）会被算成有效事件
 					// → 聚合出一条 content 为空、且不含任何错误信息的「成功」回答，
 					// 客户端既拿不到内容也不知道为什么。现在这种流回落
-					// errEmptyStream，由 handler 如实报错。
+					// errEmptyStream，由 handler 如实报错（本分支修复，上游会吸收）。
 					// （id/model/created/usage 的采集保持原样：usage 可能单独成帧。）
 					if cs, ok := chunk["choices"].([]any); ok && len(cs) > 0 {
 						validEvents++
@@ -270,7 +270,7 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 		// completion_tokens（部分上游末帧缺 total），网关合成补齐——否则严格按
 		// schema 校验的客户端收不到 total_tokens。已有 total 或二者缺一不补
 		// （不臆造：单边有值无法合成可信的 total）。
-		resp["usage"] = ensureUsageTotal(usage)
+		resp["usage"] = normalizeUsageCacheAliases(ensureUsageTotal(usage))
 	}
 	return resp, nil
 }
@@ -462,8 +462,12 @@ func normalizeFrame(obj map[string]any) map[string]any {
 		}
 		out["choices"] = nchs
 	}
-	if u, ok := obj["usage"]; ok {
-		out["usage"] = u
+	if rawUsage, ok := obj["usage"]; ok {
+		if u, ok := rawUsage.(map[string]any); ok {
+			out["usage"] = normalizeUsageCacheAliases(u)
+		} else {
+			out["usage"] = rawUsage
+		}
 	} else {
 		out["usage"] = nil
 	}
@@ -500,6 +504,7 @@ func WithErrorFrameObserver(fn func(payload string)) StreamOption {
 // error.gateway_hint。hintFn 为 nil 或返回空串 → 原样透传（零改写）。
 // 空流兜底 error 帧（"empty upstream stream"）不带 hint（网关本地故障形态
 // 未覆盖，不编造）。
+// opts：旁路观测开关（见 WithErrorFrameObserver），不改变任何透传字节。
 func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string, opts ...StreamOption) error {
 	var o streamOptions
 	for _, f := range opts {

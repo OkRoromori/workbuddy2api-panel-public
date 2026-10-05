@@ -69,8 +69,8 @@ func assertSummary(t *testing.T, got, want []string) {
 
 // TestMergeAdjacentToolCalls 背靠背的两条 assistant.tool_calls 必须合成一条。
 //
-// 这是 Responses 协议并行工具调用的报文形状（每条 function_call item →
-// 一条独立 assistant 消息），上游 deepseek 系模型对它判 11148。
+// 这是部分 OpenAI 兼容 agent 客户端回放并行工具调用的报文形状（同一批调用
+// 拆成多条独立 assistant 消息），上游 deepseek 系模型对它判 11148。
 func TestMergeAdjacentToolCalls(t *testing.T) {
 	const (
 		aNil = `{"role":"assistant","content":null,"tool_calls":[{"id":"c00","type":"function","function":{"name":"f","arguments":"{}"}}]}`
@@ -175,8 +175,8 @@ func TestMergeAdjacentToolCalls(t *testing.T) {
 	})
 }
 
-// TestPrepareBodyMergesSplitParallelToolCalls 全链路：出站管线必须把 Responses 翻译
-// 产出的「拆开的并行调用」归一到上游认可的形态。
+// TestPrepareBodyMergesSplitParallelToolCalls 全链路：出站管线必须把「拆开的并行调用」
+// 归一到上游认可的形态。
 //
 // 断言的正是线上对照实验的结论：合成一条 assistant（本测试期望的输出形态）→ 200；
 // 拆成两条 → deepseek 系模型 503/11148。
