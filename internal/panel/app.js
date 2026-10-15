@@ -21,7 +21,7 @@ const POLL_MS = 5000;
 // 为什么不用「WorkBuddy」当标题：那是腾讯的产品名，占在标题位等于把别人的品牌当成自己的
 //（在文档里提一句属于指称性使用，没问题；占品牌位就不一样了）。
 // 用版本标识当标题的额外好处：打开面板就知道服务器跑的是哪一版。
-const APP_NAME = 'v1.11.11-panel-main';
+const APP_NAME = 'v1.13.0-panel-main';
 // applyAppName 把显示名写进侧边栏与浏览器标签（index.html 里留的是同样的文本，
 // 无 JS 时也能看到，不至于空白）。
 function applyAppName() {
@@ -2013,6 +2013,9 @@ function applyStatus(d) {
   $('sHealthy').textContent = rt ? rt.healthy : d.healthy;
   $('sCooling').textContent = rt ? rt.cooling : d.cooling;
   $('sDisabled').textContent = rt ? rt.disabled : d.disabled;
+  // 暂停选号单列（上游 #125）：paused 只关选号、照常签到/活跃/保活/刷新余额，
+  // 与 disabled（需人工 revive 的终态）是两种运维状态，不能混进同一个数字。
+  if ($('sPaused')) $('sPaused').textContent = d.paused == null ? '-' : d.paused;
   $('sCredits').textContent = (d.accounts || [])
     .filter(s => panelRealm === 'all' || realmOf(s) === panelRealm)
     .reduce((a, s) => a + (s.credits || 0), 0);
@@ -4138,6 +4141,7 @@ const CFG_MAP = {
   prompt_mode: ['prompt', 'mode'], prompt_file: ['prompt', 'file'],
   sanitize_blacklist_fingerprints: ['features', 'sanitize_blacklist_fingerprints'],
   session_sticky_enabled: ['session_sticky', 'enabled'],
+  request_client_info: ['logging', 'request_client_info'],
 };
 // 覆盖型配置字段：面板里的空值**照发空串**（后端把空串视为"清掉这条覆盖"），
 // 其余字段空值 = 不下发（沿用现值）。u42：user_agent / prompt_file 是覆盖项，

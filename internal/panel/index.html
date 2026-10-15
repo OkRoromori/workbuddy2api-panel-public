@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>v1.11.11-panel-main</title>
+<title>v1.13.0-panel-main</title>
 <style>
 /* ── 设计令牌 ───────────────────────────────────────────────────────
    iOS / Apple HIG 设计语言：systemGroupedBackground 灰底画布 + 白色圆角
@@ -536,8 +536,10 @@ button.primary.danger:hover:not(:disabled) { filter: brightness(.94); }
 .stats.c5 { grid-template-columns: repeat(5, minmax(0, 1fr)); }
 .stats.c4 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
 .stats.c2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-@media (max-width: 980px) { .stats.c5, .stats.c4 { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
-@media (max-width: 560px) { .stats.c5, .stats.c4, .stats.c2 { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+.stats.c7 { grid-template-columns: repeat(7, minmax(0, 1fr)); }
+@media (max-width: 1180px) { .stats.c7 { grid-template-columns: repeat(4, minmax(0, 1fr)); } }
+@media (max-width: 980px) { .stats.c5, .stats.c4, .stats.c7 { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
+@media (max-width: 560px) { .stats.c5, .stats.c4, .stats.c2, .stats.c7 { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 /* 数值放不下时缩小字号而不是撑破卡片（差值可达 12 位）。 */
 .stat .v.sm { font-size: 22px; letter-spacing: -.02em; }
 .stat .v.xs { font-size: 17px; letter-spacing: 0; }
@@ -1396,7 +1398,7 @@ select.mini {
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="8" cy="8" r="5.2"/><circle cx="8" cy="8" r="1.6" fill="currentColor" stroke="none"/></svg>
       </div>
       <div>
-        <div class="name" id="brandName">v1.11.11-panel-main</div>
+        <div class="name" id="brandName">v1.13.0-panel-main</div>
       </div>
     </div>
     <ul>
@@ -1580,11 +1582,12 @@ select.mini {
 
     <!-- 账号池 -->
     <section class="view" id="view-accounts" hidden>
-      <div class="stats">
+      <div class="stats c7">
         <div class="stat"><div class="v" id="sTotal">-</div><div class="k">账号总数</div></div>
         <div class="stat good"><div class="v" id="sHealthy">-</div><div class="k">可用</div></div>
         <div class="stat warn"><div class="v" id="sCooling">-</div><div class="k">冷却中</div></div>
         <div class="stat bad"><div class="v" id="sDisabled">-</div><div class="k">已禁用</div></div>
+        <div class="stat"><div class="v" id="sPaused">-</div><div class="k">已暂停选号</div></div>
         <div class="stat"><div class="v" id="sCredits">-</div><div class="k">可用积分合计</div></div>
         <div class="stat"><div class="v" id="sSticky">-</div><div class="k">粘性会话</div></div>
       </div>
@@ -1935,6 +1938,9 @@ select.mini {
               <input type="checkbox" name="sanitize_blacklist_fingerprints"></div>
             <div class="switch"><span class="lb">会话粘性路由</span>
               <input type="checkbox" name="session_sticky_enabled"></div>
+            <div class="switch"><span class="lb">记录调用来源（客户端 IP / User-Agent）</span>
+              <input type="checkbox" name="request_client_info"></div>
+            <div class="hint" style="margin-top:2px;margin-bottom:6px">开启后请求归档（reqlog）记录每次调用来自哪个 IP/客户端；关闭则来源字段留空。即时生效。</div>
             <div class="hint" style="margin-top:10px">Upstash Redis 镜像、凭证目录与状态文件路径需手工编辑配置文件（判为重启项）。</div>
           </div>
         </div>

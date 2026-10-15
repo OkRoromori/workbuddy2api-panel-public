@@ -349,7 +349,9 @@ func realmCountsMapOf(total, healthy, cooling, disabled, inFlightFull int) map[s
 
 // overview 总览：池计数 + 每账号状态 + 面板元信息。
 func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
-	total, healthy, cooling, disabled, inFlightFull := p.cfg.Pool.CountsDetailed()
+	// 用 WithPaused 而不是 CountsDetailed：后者把暂停号并进 disabled（/status 的
+	// 「不可用」口径），而概况卡片要分开展示（issue #125）。
+	total, healthy, cooling, disabled, paused, inFlightFull := p.cfg.Pool.CountsDetailedWithPaused()
 	sticky := 0
 	if p.cfg.StickyCount != nil {
 		sticky = p.cfg.StickyCount()
@@ -377,6 +379,7 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 		"healthy":         healthy,
 		"cooling":         cooling,
 		"disabled":        disabled,
+		"paused":          paused,
 		"in_flight_full":  inFlightFull,
 		// realm_totals 分域计数：面板顶部的域开关切到国服/国际服时，这几个数字跟着切。
 		// 口径复用池侧同一实现（与 /status 的同名字段一致），避免前端各算一套导致漂移。
@@ -389,6 +392,9 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 		// 验活判死阈值：面板显示「连续验活失败 n/阈值」用，同样不硬编码。
 		"probe_threshold": p.cfg.Pool.ProbeThreshold(),
 		"accounts":        viewList,
+		// model_locks 模型级限流全清单（哪些模型不能用、锁了几个号、还要锁多久）：
+		// 与 accounts 的账号池视图互补，前端「模型锁池」表直接渲染。无锁时为 null。
+		"model_locks": p.cfg.Pool.ModelLockView(),
 	})
 }
 
@@ -683,7 +689,12 @@ func (p *Panel) accountCheckin(w http.ResponseWriter, r *http.Request) {
 	}
 	checkinMsg := ""
 	checkinDone := false
-	if err := p.cfg.Upstream.DailyCheckin(a); err != nil {
+	// 企业版无签到体系（上游 400 code 10001「企业账号不支持该操作」）：不发起该调用，
+	// 端点退化为「刷新额度」——企业额度走 get-enterprise-user-usage 口径（见 upstream）。
+	// 前端对企业号不渲染「签到」按钮；此处是 API 侧防御（外部脚本/旧缓存前端仍可能调用）。
+	if a.IsEnterprise() {
+		checkinMsg = "企业账号无签到体系（已跳过签到，仅刷新额度）"
+	} else if err := p.cfg.Upstream.DailyCheckin(a); err != nil {
 		// 「今天已签到」是幂等成功而不是错误：给一句人话（toast 会原样展示这个
 		// 字段），不把上游 400 的原始 JSON（含 requestId 整段）糊到用户脸上；
 		// 同时标记「今日已签」，按钮显示「已签」。其它错误仍透原样——需要完整
@@ -699,6 +710,9 @@ func (p *Panel) accountCheckin(w http.ResponseWriter, r *http.Request) {
 		checkinDone = true
 	}
 	resp := map[string]any{"ok": true, "checkin_done": checkinDone}
+	if a.IsEnterprise() {
+		resp["enterprise"] = true
+	}
 	if checkinMsg != "" {
 		resp["checkin_message"] = checkinMsg
 	}

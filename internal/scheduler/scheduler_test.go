@@ -675,9 +675,10 @@ func TestPausedVsDisabledTaskParticipation(t *testing.T) {
 }
 
 
-// TestPausedSkipsTravel 暂停号不跑旅行任务：旅行会发起对话流量，与「让位」
-// 语义矛盾（合并 #113 时补的口径，与 blackcat / 成长队列同跳）。
-func TestPausedSkipsTravel(t *testing.T) {
+// TestPausedStillTravels 暂停号照常跑旅行：旅行是纯 RPC（状态/派出/领奖 +
+// 领养前置上报），不发模型对话，与「让位防风控」不冲突——唯一被跳过的
+// 对话类任务只有夜猫子（RunNightChats 真实 ChatStream）。
+func TestPausedStillTravels(t *testing.T) {
 	f := &fakeUpstream{}
 	srv := f.server()
 	defer srv.Close()
@@ -690,7 +691,7 @@ func TestPausedSkipsTravel(t *testing.T) {
 	s := New(Config{Pool: p, Upstream: up})
 
 	s.RunTravelNow()
-	if got := f.travelCalls.Load(); got != 1 {
-		t.Errorf("travel status calls=%d want 1（仅 u1；暂停号跳过）", got)
+	if got := f.travelCalls.Load(); got != 2 {
+		t.Errorf("travel status calls=%d want 2（u1 + 暂停号 u2 照常旅行）", got)
 	}
 }

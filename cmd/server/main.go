@@ -38,11 +38,11 @@ import (
 
 // appVersion 网关版本（fork 版：面板 + 任务体系），透出到 /panel/api/overview。
 //
-// 版本号跟随原项目（linguo2625469/workbuddy2api-panel）的层级：1.11.11-panel 表示
-// 已吸收其 1.11.11 的全部修复（含 CI/号池保底/暂停选号/请求归档等）。
+// 版本号跟随原项目（linguo2625469/workbuddy2api-panel）的层级：1.13.0-panel 表示
+// 已吸收其 1.13.0 的全部修复（含企业版门控/原生工具调用修复/模型锁池等）。
 // 后缀 -main 是本分支自己的标记——指本仓库这条线（main 分支）的构建，
 // 免得面板上只看到跟原项目一样的号、分不清跑的是哪一份。
-const appVersion = "1.11.11-panel-main"
+const appVersion = "1.13.0-panel-main"
 
 // usagePathFor 由 state 文件路径推出用量文件路径：同目录、文件名 usage.json。
 // 这样 config 里改 state_file 时用量数据跟着走，不需要额外配置项。

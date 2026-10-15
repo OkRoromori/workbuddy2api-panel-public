@@ -86,10 +86,7 @@ func (p *Panel) tasksScanAll(w http.ResponseWriter, r *http.Request) {
 	items := make([]scanAccountItem, len(states))
 	var wg sync.WaitGroup
 	for i, st := range states {
-		// 暂停选号（paused）账号不进任务中心扫描：它的待办不会被队列执行
-		//（下方 startGrowthQueue 同口径跳过），扫出来只会误导「有待办可跑」。
-		// 单账号手动入口（账号行「任务」按钮）不受此限——用户显式点名仍可跑。
-		if st.Disabled || st.Paused {
+		if st.Disabled {
 			continue
 		}
 		wg.Add(1)
@@ -103,6 +100,11 @@ func (p *Panel) tasksScanAll(w http.ResponseWriter, r *http.Request) {
 			it.UID, it.Nickname = uid, a.Nickname
 			// D4 门控：global 账号无 CN 成长任务体系，不发起任何上游调用。
 			if a.IsGlobal() {
+				return
+			}
+			// 企业版门控：同上——企业版无个人成长体系（GET /v2/activity/growth/tasks
+			// 上游 403「growth system is only available for personal users」）。
+			if a.IsEnterprise() {
 				return
 			}
 			if tasks, err := p.cfg.Upstream.ListTasks(a); err != nil {
@@ -218,9 +220,7 @@ func (p *Panel) startGrowthQueue(concurrency int, growth bool) (started bool, to
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	for _, st := range states {
-		// 暂停选号（paused）账号不进执行队列：Sequential 族任务要发真实对话，
-		// 让位的号不能被自动队列拉出来跑（与 travel/blackcat 同口径）。
-		if st.Disabled || st.Paused {
+		if st.Disabled {
 			continue
 		}
 		a := p.cfg.Pool.AuthByUID(st.UID)
@@ -233,6 +233,10 @@ func (p *Panel) startGrowthQueue(concurrency int, growth bool) (started bool, to
 			one := queueAccount{a: a}
 			// D4 门控：global 账号无 CN 成长任务体系，不发起任何上游调用。
 			if a.IsGlobal() {
+				return
+			}
+			// 企业版门控：同上（企业版无个人成长体系，任务端点上游一律 403）。
+			if a.IsEnterprise() {
 				return
 			}
 			if growth {
