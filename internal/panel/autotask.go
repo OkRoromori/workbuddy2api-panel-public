@@ -215,6 +215,15 @@ var mpTaskCodes = map[string]bool{
 // isMPTaskCode 报告任务是否小程序口径专属（决定回读/接受/领奖走 mp 变体）。
 func isMPTaskCode(code string) bool { return mpTaskCodes[code] }
 
+// claimTaskReward 按任务码口径领奖：mp 码走 chat 域 mp 端点，其余走 Web 端。
+// claim 幂等（重复领返回 already_claimed → 0 分 0 能）。
+func claimTaskReward(p *Panel, a *auth.Auth, code string) (credit, energy int64, err error) {
+	if isMPTaskCode(code) {
+		return p.cfg.Upstream.ClaimRewardMP(a, code)
+	}
+	return p.cfg.Upstream.ClaimReward(a, code)
+}
+
 // taskByCode 拉取任务列表并定位单个任务；未找到返回 nil（不视为错误）。
 // 双口径：mp 专属任务在默认列表查不到，自动回落 mp 列表（仅对已登记的 mp 码，
 // 未知码不多打一次上游）。
@@ -620,6 +629,15 @@ func (p *Panel) accountTaskAuto(w http.ResponseWriter, r *http.Request) {
 	uid := r.PathValue("uid")
 	a := p.accountByUID(w, uid)
 	if a == nil {
+		return
+	}
+	// 企业上下文门控（企业版 / 企业切换会话）：行为事件会被上游静默丢弃或
+	// 直接 403，执行任何成长任务都是零收益白跑（含真实对话配额）——直接拒绝
+	// 并给出修复路径，不再让用户对着「已上报但进度 0/x」猜原因
+	// （见 auth.IsEnterpriseSession）。
+	if a.IsEnterpriseSession() {
+		writeErr(w, http.StatusUnprocessableEntity,
+			"该账号为企业版/企业切换会话（token_source=enterprise_switch），无个人成长体系，成长任务行为事件会被上游忽略；请移除账号后以个人身份重新登录")
 		return
 	}
 	var body struct {
@@ -1182,7 +1200,29 @@ func (p *Panel) runAutoAll(a *auth.Auth) []map[string]any {
 		}
 		if before.Claimed || before.Current >= before.Target && before.Target > 0 {
 			item["status"] = "skipped"
-			item["message"] = "已完成（" + taskProgressText(before) + "）"
+			msg := "已完成（" + taskProgressText(before) + "）"
+			// 达标未领：先补领再跳过（issue #174）。经真实对话等链路点亮的
+			// 任务不经过任何自动动作，若这里只 skip，奖永远没人领（积分卡在
+			// 半路）。claim 幂等（重复领返回 already_claimed → 0 分 0 能），
+			// 宁可多试一轮也不漏领；判据用 progress（Current>=Target），不
+			// 依赖 accept_status=="completed"（回读会短暂转 completed 后回滚，
+			// 据此领奖会误领）。
+			if !before.Claimed {
+				credit, energy, cerr := claimTaskReward(p, a, act.TaskCode)
+				switch {
+				case cerr != nil:
+					item["claim_error"] = cerr.Error()
+					msg += "；补领失败（可在列表手动重试）"
+				case credit > 0 || energy > 0:
+					item["claimed"] = true
+					item["credit"] = credit
+					item["energy"] = energy
+					msg += fmt.Sprintf("；已补领 +%d 分 +%d 能", credit, energy)
+				default:
+					msg += "；奖励此前已领取"
+				}
+			}
+			item["message"] = msg
 			out = append(out, item)
 			continue
 		}
@@ -1206,13 +1246,7 @@ func (p *Panel) runAutoAll(a *auth.Auth) []map[string]any {
 		// 领奖失败不掩盖主流程结果：status 仍为 done，附加 claim_error 供前端提示。
 		if after != nil && after.Claimable {
 			item["claimable"] = true
-			var credit, energy int64
-			var cerr error
-			if isMPTaskCode(act.TaskCode) {
-				credit, energy, cerr = p.cfg.Upstream.ClaimRewardMP(a, act.TaskCode)
-			} else {
-				credit, energy, cerr = p.cfg.Upstream.ClaimReward(a, act.TaskCode)
-			}
+			credit, energy, cerr := claimTaskReward(p, a, act.TaskCode)
 			if cerr == nil {
 				item["claimed"] = true
 				item["credit"] = credit
@@ -1238,6 +1272,14 @@ func (p *Panel) accountTaskAutoAll(w http.ResponseWriter, r *http.Request) {
 	uid := r.PathValue("uid")
 	a := p.accountByUID(w, uid)
 	if a == nil {
+		return
+	}
+	// 企业上下文门控：与 accountTaskAuto 同口径（企业版 / 企业切换会话下成长任务
+	// 行为事件被上游静默丢弃，跑全量只会白耗真实对话配额）。「一键完成全部」与
+	// 单任务入口共用同一套动作，必须一并挡上（下游 fork 吸收本 PR 时发现的缺口）。
+	if a.IsEnterpriseSession() {
+		writeErr(w, http.StatusUnprocessableEntity,
+			"该账号为企业版/企业切换会话（token_source=enterprise_switch），无个人成长体系，成长任务行为事件会被上游忽略；请移除账号后以个人身份重新登录")
 		return
 	}
 	// per-account 互斥（与单任务动作共用一把锁）：重复点击 409。

@@ -23,6 +23,7 @@ import (
 
 	"github.com/OkRoromori/workbuddy2api-panel-public/internal/audit"
 	"github.com/OkRoromori/workbuddy2api-panel-public/internal/auth"
+	"github.com/OkRoromori/workbuddy2api-panel-public/internal/credithist"
 	"github.com/OkRoromori/workbuddy2api-panel-public/internal/httpauth"
 	"github.com/OkRoromori/workbuddy2api-panel-public/internal/livecfg"
 	"github.com/OkRoromori/workbuddy2api-panel-public/internal/logfmt"
@@ -97,6 +98,9 @@ type Config struct {
 	Usage *usage.Recorder
 	// RequestLog 请求指标与归档（nil = 对应接口返回 501）。
 	RequestLog *reqlog.Recorder
+	// CreditHistory 积分变动账本（nil = 积分历史接口返回 501）。只读展示：
+	// 留痕由余额查询路径（upstream.Client 的余额观察者）写入。
+	CreditHistory *credithist.Ledger
 
 	// ProbeFile 模型输出上限探测结果文件（scripts/probe_max_tokens.py --panel-out
 	// 写入；空或文件不存在 = model_probes 端点返回空集，面板不显示任何实测标注）。
@@ -215,10 +219,13 @@ func (p *Panel) Logs() *Ring { return p.logs }
 func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/{$}", p.index)
 	p.mux.HandleFunc("GET /panel/app.js", p.appScript)
+	p.mux.HandleFunc("GET /panel/mobile.css", p.mobileStyle)
+	p.mux.HandleFunc("GET /panel/mobile.js", p.mobileScript)
 	p.mux.HandleFunc("GET /panel/api/overview", p.withAuth(p.overview))
 	p.mux.HandleFunc("GET /panel/api/logs", p.withAuth(p.logsHandler))
 	p.mux.HandleFunc("GET /panel/api/request_metrics", p.withAuth(p.requestMetrics))
 	p.mux.HandleFunc("GET /panel/api/request_logs", p.withAuth(p.requestLogs))
+	p.mux.HandleFunc("GET /panel/api/credit_history", p.withAuth(p.creditHistory))
 	p.mux.HandleFunc("GET /panel/api/models", p.withAuth(p.modelsCached))
 	p.mux.HandleFunc("POST /panel/api/login/start", p.withAuth(p.loginStart))
 	p.mux.HandleFunc("GET /panel/api/login/poll", p.withAuth(p.loginPoll))
@@ -277,6 +284,10 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("POST /panel/api/remove_disabled", p.withAuth(p.removeDisabled))
 	p.mux.HandleFunc("POST /panel/api/auto_all", p.withAuth(p.autoAllPool))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/tasks/claim_all", p.withAuth(p.taskClaimAll))
+	// 官方补偿活动（issue #189）：查状态 / 单号领取 / 全量领取。
+	p.mux.HandleFunc("GET /panel/api/compensation", p.withAuth(p.compensation))
+	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/compensation", p.withAuth(p.accountCompensationClaim))
+	p.mux.HandleFunc("POST /panel/api/compensation_all", p.withAuth(p.compensationAll))
 }
 
 // usageDispatch `/panel/api/usage` 的双口径分发：两条功能线各有一个 "usage" 接口，
@@ -330,6 +341,19 @@ func (p *Panel) expiringSoonWindow() time.Duration {
 		return 0
 	}
 	return p.cfg.Scheduler.ExpiringSoonWindow()
+}
+
+// poolExpiryBuckets 把 upstream 的按日到期批次转换为 pool 结构。两个包字段同构，
+// 手工转换是为了不让底层 pool 反向依赖 upstream。
+func poolExpiryBuckets(in []upstream.ExpiryBucket) []pool.ExpiryBucket {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]pool.ExpiryBucket, len(in))
+	for i, b := range in {
+		out[i] = pool.ExpiryBucket{Date: b.Date, ExpireAt: b.ExpireAt, Remain: b.Remain}
+	}
+	return out
 }
 
 // ---------------------------------------------------------------------------
@@ -395,7 +419,27 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 		// model_locks 模型级限流全清单（哪些模型不能用、锁了几个号、还要锁多久）：
 		// 与 accounts 的账号池视图互补，前端「模型锁池」表直接渲染。无锁时为 null。
 		"model_locks": p.cfg.Pool.ModelLockView(),
+		// 到期提醒快照的节奏与年龄：界面轮询是 5 秒级，但卡片数据只随余额后台刷新
+		// 更新（默认每 5 分钟）——把这两个数透出，前端才能如实标注「x 分钟前更新」。
+		"balance_refresh_sec":  p.balanceRefreshSec(),
+		"balance_refreshed_at": p.balanceRefreshedAt(),
 	})
+}
+
+// balanceRefreshSec 余额后台刷新间隔（秒）；无调度器/未开启时为 0。
+func (p *Panel) balanceRefreshSec() int {
+	if p.cfg.Scheduler == nil {
+		return 0
+	}
+	return int(p.cfg.Scheduler.BalanceInterval() / time.Second)
+}
+
+// balanceRefreshedAt 最近一次后台余额刷新完成时刻；无调度器或尚未跑过为零值。
+func (p *Panel) balanceRefreshedAt() time.Time {
+	if p.cfg.Scheduler == nil {
+		return time.Time{}
+	}
+	return p.cfg.Scheduler.BalanceRefreshedAt()
 }
 
 // accountView 账号状态 + 面板展示层的别名覆盖（alias.go）。
@@ -480,6 +524,67 @@ func (p *Panel) requestLogs(w http.ResponseWriter, r *http.Request) {
 		rows = []reqlog.Event{}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"entries": rows, "limit": limit})
+}
+
+// creditHistory 返回积分变动流水（新的在前），供「运行日志 → 积分历史」展示。
+// limit 默认 200、上限 1000（与 requestLogs 同口径）；可带 uid 精确过滤。
+// 账号昵称在读取时用池快照填充——账本只存 uid，上游改名后旧流水也跟着更新，
+// 且留痕路径不必碰 auth 的昵称锁。
+func (p *Panel) creditHistory(w http.ResponseWriter, r *http.Request) {
+	if p.cfg.CreditHistory == nil {
+		writeErr(w, http.StatusNotImplemented, "credit history not available")
+		return
+	}
+	limit := 200
+	if v := r.URL.Query().Get("limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			limit = n
+		}
+	}
+	if limit > 1000 {
+		limit = 1000
+	}
+	uid := r.URL.Query().Get("uid")
+	nicks := p.nicknames()
+	// 有 uid 过滤时必须先全量取回（账本上限默认 2000 条）：先截断再过滤会让
+	// 筛选后的条数看起来像历史缺失。无过滤时只取 limit 条，不为一次展示拷贝整个账本。
+	readLimit := limit
+	if uid != "" {
+		readLimit = 0
+	}
+	all := p.cfg.CreditHistory.Read(readLimit)
+	out := make([]map[string]any, 0, limit)
+	for _, e := range all {
+		if uid != "" && e.UID != uid {
+			continue
+		}
+		out = append(out, map[string]any{
+			"time":    e.Time,
+			"uid":     e.UID,
+			"account": nicks[e.UID],
+			"delta":   e.Delta,
+			"before":  e.Before,
+			"after":   e.After,
+		})
+		if len(out) >= limit {
+			break
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"entries": out, "limit": limit})
+}
+
+// nicknames 池内 uid → 昵称映射（仅展示用，不含任何凭证）。
+func (p *Panel) nicknames() map[string]string {
+	nicks := map[string]string{}
+	if p.cfg.Pool == nil {
+		return nicks
+	}
+	for _, s := range p.cfg.Pool.List() {
+		if s.Nickname != "" {
+			nicks[s.UID] = s.Nickname
+		}
+	}
+	return nicks
 }
 
 // models 实时查询上游模型列表与 reasoning 实际档位（直连上游，不读路由层 1h 缓存）：
@@ -716,14 +821,21 @@ func (p *Panel) accountCheckin(w http.ResponseWriter, r *http.Request) {
 	if checkinMsg != "" {
 		resp["checkin_message"] = checkinMsg
 	}
-	remain, total, expiring, earliestAt, earliestRemaining, err := p.cfg.Upstream.UserResourceDetailedWithExpiry(a, p.expiringSoonWindow())
+	remain, total, expiring, earliestAt, earliestRemaining, buckets, err := p.cfg.Upstream.UserResourceSnapshot(a, p.expiringSoonWindow())
 	if err != nil {
 		resp["balance_error"] = err.Error()
 		writeJSON(w, http.StatusOK, resp)
 		return
 	}
 	p.cfg.Pool.ReenableIfCredits(uid, remain, total)
-	p.cfg.Pool.SetCreditsDetailed(uid, remain, total, expiring, earliestAt, earliestRemaining)
+	p.cfg.Pool.SetCreditsSnapshot(uid, pool.CreditsSnapshot{
+		Remain:            remain,
+		Total:             total,
+		Expiring:          expiring,
+		EarliestAt:        earliestAt,
+		EarliestRemaining: earliestRemaining,
+		ExpiryBuckets:     poolExpiryBuckets(buckets),
+	})
 	resp["credits"] = remain
 	resp["credits_total"] = total
 	log.Printf("panel: checkin uid=%s msg=%q credits=%d/%d", uid, checkinMsg, remain, total)
@@ -762,12 +874,19 @@ func (p *Panel) accountBalance(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "account not found")
 		return
 	}
-	remain, total, expiring, earliestAt, earliestRemaining, err := p.cfg.Upstream.UserResourceDetailedWithExpiry(a, p.expiringSoonWindow())
+	remain, total, expiring, earliestAt, earliestRemaining, buckets, err := p.cfg.Upstream.UserResourceSnapshot(a, p.expiringSoonWindow())
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, "user resource: "+err.Error())
 		return
 	}
-	p.cfg.Pool.SetCreditsDetailed(uid, remain, total, expiring, earliestAt, earliestRemaining)
+	p.cfg.Pool.SetCreditsSnapshot(uid, pool.CreditsSnapshot{
+		Remain:            remain,
+		Total:             total,
+		Expiring:          expiring,
+		EarliestAt:        earliestAt,
+		EarliestRemaining: earliestRemaining,
+		ExpiryBuckets:     poolExpiryBuckets(buckets),
+	})
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "credits": remain, "credits_total": total})
 }
 
@@ -923,6 +1042,92 @@ func (p *Panel) balanceAll(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "accounts": p.cfg.Pool.List()})
 }
 
+// compensation 查询全部账号的补偿活动状态（**只读**，不发起任何领取）。
+//
+// 与 balanceAll 同构：同步等待而非「触发后盲刷」——账号量小（个位数），
+// 面板拿到响应即可直接渲染横幅，不用再轮询。
+func (p *Panel) compensation(w http.ResponseWriter, r *http.Request) {
+	if p.cfg.Scheduler == nil {
+		writeErr(w, http.StatusNotImplemented, "scheduler not available")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":       true,
+		"accounts": p.cfg.Scheduler.CompensationStatusAll(),
+	})
+}
+
+// accountCompensationClaim 单号领取补偿：查状态 → 待领才领（幂等）。
+// 领完顺带刷一次余额，面板上的积分数字立即反映到账。
+func (p *Panel) accountCompensationClaim(w http.ResponseWriter, r *http.Request) {
+	if p.cfg.Scheduler == nil {
+		writeErr(w, http.StatusNotImplemented, "scheduler not available")
+		return
+	}
+	uid := r.PathValue("uid")
+	res, err := p.cfg.Scheduler.ClaimCompensationFor(uid)
+	if err != nil {
+		writeErr(w, http.StatusNotFound, err.Error())
+		return
+	}
+	if res.Claimed {
+		p.refreshCreditsQuiet(uid)
+	}
+	// ok 反映「是否拿到确定结论」：error 非空即 false。注意前端 api() 只看
+	// HTTP 状态码，这个字段是给日志/调用方看的，真正的分流依据是 result.error。
+	writeJSON(w, http.StatusOK, map[string]any{"ok": res.Error == "", "result": res})
+}
+
+// compensationAll 手动全量领取补偿（逐号查状态后领取；无待领的号静默跳过）。
+func (p *Panel) compensationAll(w http.ResponseWriter, r *http.Request) {
+	if p.cfg.Scheduler == nil {
+		writeErr(w, http.StatusNotImplemented, "scheduler not available")
+		return
+	}
+	results := p.cfg.Scheduler.ClaimCompensationNow()
+	for _, res := range results {
+		if res.Claimed {
+			p.refreshCreditsQuiet(res.UID)
+		}
+	}
+	summary := scheduler.SummarizeCompensation(results)
+	log.Printf("panel: 手动全量补偿领取完成 合计=%d 领取=%d(+%dc) 跳过=%d 失败=%d",
+		summary.Total, summary.Claimed, summary.Credit, summary.Skipped, summary.Errored)
+	// ok=false 表示有账号没拿到确定结论；前端据此提示「查询失败」而不是
+	// 「没有待领补偿」——两者语义完全相反，不能混。
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":      summary.OK(),
+		"summary": summary,
+		"results": results,
+	})
+}
+
+// b2i bool → int（汇总计数用）。
+func b2i(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
+}
+
+// refreshCreditsQuiet 领取成功后刷新该号余额，失败不影响领取结果回传。
+//
+// 失败只记日志不返回：领取本身已经成功并落到上游，余额刷新失败只是展示滞后，
+// 前端紧接着还会拉一次 overview。静默吞掉会让「积分没变」看起来像没领到。
+func (p *Panel) refreshCreditsQuiet(uid string) {
+	a := p.cfg.Pool.AuthByUID(uid)
+	if a == nil {
+		return
+	}
+	remain, total, expiring, earliestAt, earliestRemaining, err :=
+		p.cfg.Upstream.UserResourceDetailedWithExpiry(a, p.expiringSoonWindow())
+	if err != nil {
+		log.Printf("panel: compensation 后刷新余额失败 uid=%s: %v", uid, err)
+		return
+	}
+	p.cfg.Pool.SetCreditsDetailed(uid, remain, total, expiring, earliestAt, earliestRemaining)
+}
+
 // syncNicknames 手动刷新时的昵称同步（issue #94：上游改名免重登）。
 // 只在面板手动「刷新」路径调用——后台余额定时器不触发（用户明确要求资料接口
 // 仅手动触达）。逐号拉 /console/account，只取 nickname（手机号等敏感字段在
@@ -1009,12 +1214,7 @@ func (p *Panel) usage(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	// 昵称仅用于展示，取自池快照（不含任何凭证）。
-	nicks := map[string]string{}
-	for _, s := range p.cfg.Pool.List() {
-		if s.Nickname != "" {
-			nicks[s.UID] = s.Nickname
-		}
-	}
+	nicks := p.nicknames()
 	var currentRate func(realm, model string) string
 	if p.cfg.Upstream != nil {
 		currentRate = p.cfg.Upstream.ModelRate

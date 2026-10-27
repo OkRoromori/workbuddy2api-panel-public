@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -282,5 +283,98 @@ func TestConfigFormMatchesCFGMap(t *testing.T) {
 	}
 	if !names["request_client_info"] {
 		t.Error("配置表单缺「记录调用来源」开关（logging.request_client_info）")
+	}
+}
+
+// TestAppJSCreditHistoryFormatting 积分历史区块：变动列 +N / −N（U+2212）、
+// 余额千分位、空列表提示。纯格式化函数按切片做 node 侧断言。
+func TestAppJSCreditHistoryFormatting(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; credit history formatting test skipped")
+	}
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const start = src.indexOf('function creditNum');
+const end = src.indexOf('function renderCreditHistory');
+if (start < 0 || end < 0) throw new Error('credit history helpers not found');
+const ctx = { Date, Number, String, Math, RegExp, isNaN, toLocaleString: undefined };
+vm.createContext(ctx);
+vm.runInContext(
+  src.slice(start, end) +
+  '\nthis.creditEntryText=creditEntryText;this.creditHistoryNote=creditHistoryNote;',
+  ctx
+);
+const time = new Date(2026, 8, 28, 14, 5, 6).toISOString();
+process.stdout.write(JSON.stringify({
+  gain: ctx.creditEntryText({ time, uid: '89374120', account: '小明', delta: 100, before: 1300, after: 1400 }),
+  loss: ctx.creditEntryText({ time, uid: '89374120', account: '', delta: -30, before: 1400, after: 1370 }),
+  note: ctx.creditHistoryNote([{ delta: 1300 }, { delta: -60 }]),
+  empty: ctx.creditHistoryNote([]),
+}));`
+	f, err := os.CreateTemp(t.TempDir(), "credit-history-format-*.cjs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(script); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	out, err := exec.Command(node, f.Name(), "app.js").CombinedOutput()
+	if err != nil {
+		t.Fatalf("credit history formatting node test failed: %v\n%s", err, out)
+	}
+	gain := "14:05:06 | 小明 | +100 | 1,400 | 余额 1,300 → 1,400"
+	loss := "14:05:06 | 89374120 | −30 | 1,370 | 余额 1,400 → 1,370"
+	want := `{"gain":` + strconv.Quote(gain) + `,"loss":` + strconv.Quote(loss) +
+		`,"note":"2 条 · 净 +1,240","empty":"暂无积分变动记录"}`
+	if strings.TrimSpace(string(out)) != want {
+		t.Fatalf("credit history formatting=%s want %s", out, want)
+	}
+}
+
+// TestRegionSchedulingFormRoundTrip 按地区调度策略/账号顺序在配置表单里往返：
+// 读入（数组 → 逗号串）→ 修改 → 收集（逗号串 → 数组），且键缺席时 select 回落默认。
+func TestRegionSchedulingFormRoundTrip(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not available")
+	}
+	script := `const fs=require('fs'), vm=require('vm'), assert=require('assert');
+ const src=fs.readFileSync(process.argv[2],'utf8');
+ const html=fs.readFileSync('index.html','utf8');
+ const elements={};
+ for(const name of ['strategy_domestic','strategy_international','domestic_account_order','international_account_order']) {
+   assert(html.includes('name="'+name+'"'), 'missing form field '+name);
+   elements[name]={type:name.startsWith('strategy_')?'select-one':'text',value:''};
+ }
+ const cfg={pool:{strategy:{domestic:'round_robin',international:'sequential_exhaust'},account_order:{domestic:['c','a'],international:['y','x']}}};
+ const nodes={cfgForm:{elements},cfgPath:{},cfgNote:{}};
+ const ctx={cfgLoaded:null,api:async()=>({config:cfg}),$:id=>nodes[id],markDurationFields(){},syncAllControls(){},toast(message){throw Error(message)}};
+ vm.createContext(ctx);
+ vm.runInContext(src.slice(src.indexOf('const CFG_MAP ='),src.indexOf("$('btnEye')")),ctx);
+ (async()=>{
+   await ctx.loadConfig();
+   assert.equal(elements.strategy_domestic.value,'round_robin');
+   assert.equal(elements.strategy_international.value,'sequential_exhaust');
+   assert.equal(elements.domestic_account_order.value,'c, a');
+   elements.strategy_domestic.value='weighted_random';
+   elements.international_account_order.value='';
+   const result=ctx.collectConfig();
+   assert.equal(result.pool.strategy.domestic,'weighted_random');
+   assert.equal(result.pool.strategy.international,'sequential_exhaust');
+   assert.equal(JSON.stringify(result.pool.account_order.domestic),'["c","a"]');
+   assert.equal(JSON.stringify(result.pool.account_order.international),'[]');
+   delete cfg.pool.strategy; await ctx.loadConfig();
+   assert.equal(elements.strategy_domestic.value,'weighted_random');
+   assert.equal(elements.strategy_international.value,'weighted_random');
+ })().catch(e=>{console.error(e);process.exitCode=1});`
+	fp := filepath.Join(t.TempDir(), "region-form.cjs")
+	if err = os.WriteFile(fp, []byte(script), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command(node, fp, "app.js").CombinedOutput(); err != nil {
+		t.Fatalf("form round trip: %v\n%s", err, out)
 	}
 }

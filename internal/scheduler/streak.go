@@ -29,8 +29,8 @@ func (s *Scheduler) RunStreakBonusNow() {
 		if a.IsGlobal() {
 			continue // D4 门控：global 无 CN 任务体系，不发起任何上游调用
 		}
-		if a.IsEnterprise() {
-			continue // 企业版门控：无成长体系（/activity/growth/streak 上游一律 403）
+		if a.IsEnterpriseSession() {
+			continue // 企业版 / 企业切换会话门控：无成长体系（/activity/growth/streak 企业号 403；切换会话 200 但不计分）
 		}
 		s.streakBonusAccount(a)
 	}
@@ -44,9 +44,11 @@ func (s *Scheduler) streakBonusAccount(a *auth.Auth) {
 	if credit, err := s.cfg.Upstream.ClaimGift(a); err == nil {
 		log.Printf("streak-bonus %s: 🎊 新手礼包 +%dc", logfmt.Label(a.UID, a.Nickname), credit)
 	}
-	if credit, err := s.cfg.Upstream.ClaimCompensation(a); err == nil {
-		log.Printf("streak-bonus %s: 🎊 补偿领取 +%dc", logfmt.Label(a.UID, a.Nickname), credit)
-	}
+	// 补偿改为「先查状态 → 待领才领」（issue #189）：旧写法 `if credit, err :=
+	// ClaimCompensation(...); err == nil` 把「没有补偿」「已经领过」与「领取真的
+	// 失败」压成同一形态，补偿带截止日（实测那次为 10/22）时签到一旦停摆就静默
+	// 过期。现在无待领不记日志，但状态查询失败与领取失败一律显式告警。
+	s.claimCompensationQuiet(a)
 
 	full, err := s.cfg.Upstream.GrowthStreakFull(a)
 	if err != nil {

@@ -393,6 +393,28 @@ func TestDisablePersists(t *testing.T) {
 	}
 }
 
+// issue #171 问题一：软冷却到期后 until/coolKind/reason 字段按设计不清理，
+// statusOf 不应再把过期 reason 透出给面板（避免「可用」旁挂着历史 429）。
+func TestStatusReasonHiddenAfterCooldownExpires(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	// 冷却中：reason 正常透出。
+	p.Cooldown("u1", CoolSoft, time.Hour, "429 rate limit")
+	st, ok := p.Status("u1")
+	if !ok || !st.Cooling || st.Reason != "429 rate limit" {
+		t.Fatalf("cooling status=%+v ok=%v", st, ok)
+	}
+	// 冷却到期、字段残留（NoteSuccess 不碰 until/coolKind/reason）：不再透出。
+	p.Cooldown("u1", CoolSoft, -time.Minute, "429 rate limit")
+	st, ok = p.Status("u1")
+	if !ok || st.Cooling {
+		t.Fatalf("expired cooldown should not be cooling: %+v", st)
+	}
+	if st.Reason != "" {
+		t.Fatalf("expired cooldown reason leaked to status: %q", st.Reason)
+	}
+}
+
 func TestReenableIfCredits(t *testing.T) {
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
@@ -1908,6 +1930,60 @@ func TestCreditExpirySnapshotConsumptionAndClear(t *testing.T) {
 	st, _ = p.Status("u1")
 	if st.CreditsExpiring != 0 || st.CreditsEarliestRemaining != 0 || !st.CreditsEarliestExpiry.IsZero() {
 		t.Fatalf("zero refresh did not clear snapshot=%+v", st)
+	}
+}
+
+// TestExpiryBucketsFEFOAndPersistence 钉住按日到期批次的三件事：
+//  1. 最早批次以 buckets 为准（同日多包合计已在写入前完成），而不是入参单批值；
+//  2. 两次余额刷新之间按 FEFO 扣减，扣穿第一桶后最早批次顺延到下一桶；
+//  3. state.json / Redis 快照往返不丢批次，重启后首页快照仍与「检查」同口径。
+func TestExpiryBucketsFEFOAndPersistence(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	now := time.Now()
+	at1 := now.Add(24 * time.Hour)
+	at2 := now.Add(48 * time.Hour)
+	p.SetCreditsSnapshot("u1", CreditsSnapshot{
+		Remain: 300, Total: 300, Expiring: 100,
+		// 故意给一个与 buckets 不一致的最早值：buckets 必须优先。
+		EarliestAt: at1, EarliestRemaining: 999,
+		ExpiryBuckets: []ExpiryBucket{
+			{Date: at1.Format("2006-01-02"), ExpireAt: at1, Remain: 100},
+			{Date: at2.Format("2006-01-02"), ExpireAt: at2, Remain: 200},
+		},
+	})
+	st, _ := p.Status("u1")
+	if len(st.CreditsExpiryBuckets) != 2 || st.CreditsEarliestRemaining != 100 || !st.CreditsEarliestExpiry.Equal(at1) {
+		t.Fatalf("initial buckets=%+v earliest=%v/%d", st.CreditsExpiryBuckets, st.CreditsEarliestExpiry, st.CreditsEarliestRemaining)
+	}
+
+	// 扣 150：第一桶扣穿（100），第二桶剩 150，最早批次顺延到 at2。
+	p.NoteModelCost("u1", "m", 150, 1000)
+	st, _ = p.Status("u1")
+	if st.Credits != 150 || len(st.CreditsExpiryBuckets) != 1 || st.CreditsExpiryBuckets[0].Remain != 150 {
+		t.Fatalf("after consume buckets=%+v credits=%d", st.CreditsExpiryBuckets, st.Credits)
+	}
+	if !st.CreditsEarliestExpiry.Equal(at2) || st.CreditsEarliestRemaining != 150 {
+		t.Fatalf("earliest after consume=%v/%d want %v/150", st.CreditsEarliestExpiry, st.CreditsEarliestRemaining, at2)
+	}
+
+	// 持久化往返。
+	p.mu.Lock()
+	sf := p.stateOverviewLocked()
+	p.mu.Unlock()
+	if got := sf.Accounts["u1"].CreditsExpiryBuckets; len(got) != 1 || got[0].Remain != 150 {
+		t.Fatalf("persisted buckets=%+v", got)
+	}
+	p2 := New("")
+	p2.mu.Lock()
+	p2.applyAccountsLocked(sf.Accounts)
+	p2.mu.Unlock()
+	st2, ok := p2.Status("u1")
+	if !ok || len(st2.CreditsExpiryBuckets) != 1 || st2.CreditsExpiryBuckets[0].Remain != 150 {
+		t.Fatalf("restored buckets=%+v", st2.CreditsExpiryBuckets)
+	}
+	if !st2.CreditsEarliestExpiry.Equal(at2) || st2.CreditsEarliestRemaining != 150 {
+		t.Fatalf("restored earliest=%v/%d", st2.CreditsEarliestExpiry, st2.CreditsEarliestRemaining)
 	}
 }
 

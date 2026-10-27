@@ -33,6 +33,36 @@ func (p *Pool) AvailableUIDsForRealm(realm string) []string {
 	return uids
 }
 
+// ServableForModelRealm 返回 realm 内此刻**真正能服务该模型**的账号数。
+//
+// 与 pick 的候选口径一致（healthyForModel 的 6004/11102 模型级冷却豁免、在途租约、
+// 积分保底都计入），但**不含 pick 的全冷却兜底**——跨域回退（issue #135）要的正是
+// 「这个域此刻有没有健康号」，兜底把冷却号捞回来的乐观语义会掩盖这一点。
+//
+// 只读：持 RLock 遍历，不改任何状态。realm=="" 时统计全池（与既有 realm 语义一致）。
+func (p *Pool) ServableForModelRealm(model, realm string) int {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	now := time.Now()
+	n := 0
+	for _, e := range p.byUID {
+		if realm != "" && e.a.Realm() != realm {
+			continue
+		}
+		if !e.healthyForModel(now, model) {
+			continue
+		}
+		if p.inFlightFull(e) {
+			continue
+		}
+		if p.floorBlockedForRealmModel(e, model, realm, now) {
+			continue
+		}
+		n++
+	}
+	return n
+}
+
 // WeightedAvailableUIDsForModelRealm 返回带虚拟实例权重的可用账号列表。
 //
 // 普通账号出现 1 次；有效快过期账号出现 expiringVirtualSlots 次。调用方继续按

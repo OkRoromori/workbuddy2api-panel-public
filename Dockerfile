@@ -2,7 +2,10 @@
 FROM golang:1.23-alpine AS build
 WORKDIR /src
 COPY go.mod ./
-RUN go mod download
+# 防止因为直接使用官方源导致下载失败
+RUN go env -w GOPROXY=https://goproxy.cn,direct && \
+    go env GOPROXY && \
+    go mod download
 COPY . .
 # 一次编译全部二进制（工具进镜像，容器内可直接跑脚本）。全部 -trimpath -s -w。
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/wb2api ./cmd/server \

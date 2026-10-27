@@ -9,6 +9,7 @@
 package livecfg
 
 import (
+	"strings"
 	"sync/atomic"
 	"time"
 )
@@ -25,7 +26,6 @@ type Snapshot struct {
 	APIKey               string        // 网关/面板共同鉴权密钥；空 = 不鉴权
 	SoftCooldown         time.Duration // 429 软冷却基数（<=0 时调用方回退内置默认）
 	SanitizeFingerprints bool          // 出站请求体指纹脱敏
-
 	// Keys 网关 /v1 的多密钥表（密钥 → 审计名），含主密钥。
 	//
 	// 不可变约定：Store 之后任何人不许再改这个 map（读方拿到的是同一份引用，
@@ -45,6 +45,9 @@ type Snapshot struct {
 
 	// RecordClientInfo 请求日志是否记录调用来源（客户端 IP / UA）。
 	RecordClientInfo bool
+
+	// HiddenModels 精确隐藏的模型 id（已归一化为 "cn:x"/"global:x" 全量形式）；nil = 不隐藏。
+	HiddenModels map[string]struct{}
 }
 
 // ClientKeys 返回网关鉴权用的密钥表。
@@ -86,3 +89,31 @@ func (h *Holder) Load() Snapshot {
 
 // Store 整体替换快照。
 func (h *Holder) Store(s Snapshot) { h.p.Store(&s) }
+
+// NormalizeHiddenModels 把用户配置的 hidden 条目归一化为精确 id 集合。
+//
+// 条目带合法 "cn:"/"global:" 前缀 → 只隐藏该域；裸名 → 两域都隐藏。
+// 大小写敏感（与 internal/server.resolveModel 的前缀规则对称：取第一个 ":",
+// 前段恰为 "cn"/"global" 才剥离）。返回的 map 只读共享，调用方不得修改。
+func NormalizeHiddenModels(hidden []string) map[string]struct{} {
+	if len(hidden) == 0 {
+		return nil
+	}
+	out := make(map[string]struct{}, len(hidden)*2)
+	for _, m := range hidden {
+		m = strings.TrimSpace(m)
+		if m == "" {
+			continue
+		}
+		if prefix, bare, ok := strings.Cut(m, ":"); ok && (prefix == "cn" || prefix == "global") {
+			out[prefix+":"+bare] = struct{}{}
+		} else {
+			out["cn:"+m] = struct{}{}
+			out["global:"+m] = struct{}{}
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}

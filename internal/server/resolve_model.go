@@ -121,3 +121,13 @@ func ResolveModel(model string) (realm, bare string) { return resolveModel(model
 func ResolveModelWithRealm(model, prefer string, pins map[string]string) (realm, bare string) {
 	return resolveModelWithRealm(model, prefer, pins)
 }
+
+// resolveModelDetail 是跨域回退判定所需的形态：第三个返回值表示 realm 是否
+// 由调用方显式写出（"cn:"/"global:" 前缀）。裸名返回 realm="cn"、explicit=false，
+// 与上游 resolveModelDetail 的语义对齐；实际选号域仍由 resolveModelRealm 校准。
+func resolveModelDetail(model string) (realm, bare string, realmExplicit bool) {
+	if r, b, ok := parseModelPrefix(model); ok {
+		return r, b, true
+	}
+	return "cn", model, false
+}

@@ -12,6 +12,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"os"
 	"regexp"
 	"sort"
 	"strconv"
@@ -37,10 +38,12 @@ const (
 	ErrContentBlocked                // 内容策略拦截（400 + 审核文案）→ 不罚账号，走降级重试
 	ErrBadParams                     // 请求体解析失败（400 + Unmarshal chat params failed / 11101）→ 请求级错误：不罚号、不轮转，末端 400 透传原文
 	ErrAccountFault                  // 账号级授权/配额故障（11140 request illegal / 14017 trial not activated）→ 冷却轮换，不无限重试
+	ErrChannelRefused                // 11128 request illegal 通道校验失败（上游认为请求不是官方客户端发的）→ 不罚账号
 	ErrModelBlocked                  // 11102「该后端无此模型」→ (账号,模型) 负缓存避让，切模型/切账号
 	ErrWafBlock                      // 403 + 非业务信封体（APISIX WAF 拦截页/空体）→ 账号软冷却 + 抖动退避
 	ErrPromptTooLong                 // 11115「prompt is too long」→ 请求级错误（上下文超限是请求的问题非账号的问题）：不罚号、不轮转，末端透传原文
 	ErrImageInvalid                  // 图片请求格式/数据无效 → 请求级错误：不罚号、不轮转，末端透传原文
+	ErrUpstreamBusy                  // 6021「queue.full.title」渠道级容量满载（非账号问题）→ 不罚号、不轮转，末端 503 + upstream_busy
 	ErrClient                        // 其他 4xx / 业务错误
 )
 
@@ -68,8 +71,12 @@ func (k ErrKind) String() string {
 		return "prompt_too_long"
 	case ErrImageInvalid:
 		return "image_invalid"
+	case ErrUpstreamBusy:
+		return "upstream_busy"
 	case ErrAccountFault:
 		return "account_fault"
+	case ErrChannelRefused:
+		return "channel_refused"
 	case ErrClient:
 		return "client"
 	default:
@@ -122,23 +129,56 @@ var softRateMarkers = []string{
 
 var sessionDeadMarkers = []string{"Offline user session not found", "12153"}
 
+// isQueueFullBody 判定渠道级容量满载文案（6021 queue.full.title 家族）。
+// 该形态表明上游推理集群排队队列打满，与具体账号无关；换号在任何时刻都会撞
+// 同一堵墙，正确处置是不罚号不轮转（见 Classify 的 6021 分支）。子串口径但
+// 用完整固定文案（"queue.full"），避免与普通限流文案误撞。
+func isQueueFullBody(lower string) bool {
+	return strings.Contains(lower, "queue.full") || strings.Contains(lower, "queue full")
+}
+
 // accountFaultMarkers 账号级授权/配额故障关键词（大小写不敏感子串匹配）。
 //
 // 定位：这类错误是**账号本身状态**决定的本机故障，不是请求格式、不是临时限流、
 // 也不是内容误报——继续重试只会反复刷上游风控/配额检查，必须把该账号冷却轮换。
-//   - "request illegal"（code 11140）→ 上游 auth/auth_forbidden，账号级授权风控，
-//     需重新 OAuth 登录才能恢复，短冷却只能阻止继续送死。
 //   - code 14017（"trial not activated" / "The trial version is not yet activated"）→
 //     上游 quota/quota_not_activated，register 未完成的试用未激活账号，同样账号级。
 //
-// 注意 11140 **不能**按 code 判定：该 code 也承载模型级限流文案（"The model provider
-// is rate-limiting requests."），那种场景必须保持 ErrSoftRate（下方 softRateMarkers
-// 后判定）。故此处只收 msg 关键词 "request illegal"（auth_forbidden 的真实文案）。
-// 14017 文案唯一（无软限流歧义），可安全收录。
+// 注意 **"request illegal" 不能作为通用 marker**：WorkBuddy 的 11128 通道校验失败
+// （`{"code":"11-128","msg":"request illegal"}`，displayTips 明确说「可能不是官方客户端
+// 发送」）与 11140 账号限制（`{"code":11140,"msg":"request illegal"}`）文案完全相同。
+// 只看文案会把一次通道校验失败误判成账号封禁并硬禁用健康账号。11140 的判定统一走
+// IsAccountRestricted（code + 文案双条件），不放进本词表。
+// 另：11140 **不能**按 code 单独判定——该 code 也承载模型级限流文案（"The model
+// provider is rate-limiting requests."），那种场景必须保持 ErrSoftRate（下方
+// softRateMarkers 后判定）。
 var accountFaultMarkers = []string{
-	"request illegal",
 	"trial not activated",
 	"trial version is not yet activated",
+}
+
+// accountRestrictedMsg 是 WorkBuddy 11140 账号限制的正文关键词。
+const accountRestrictedMsg = "request illegal"
+
+// IsAccountRestricted 报告上游 body 是否为 WorkBuddy 的账号级限制（11140
+// "request illegal"）。必须 code + 文案双条件：
+//   - 只看文案："request illegal" 也出现在 11128 通道校验失败里（健康账号）；
+//   - 只看 code：11140 也承载模型级限流文案（应归 ErrSoftRate）。
+func IsAccountRestricted(body string) bool {
+	if !strings.Contains(strings.ToLower(body), accountRestrictedMsg) {
+		return false
+	}
+	return hasBusinessCode(body, "11140")
+}
+
+// isChannelRefused 报告上游 body 是否为 WorkBuddy 的通道校验失败（11128
+// "request illegal"）。11128 还承载内容审核变体（"blocked by security policy"，
+// 归 ErrContentBlocked），故必须 code + 文案双条件，不能按 code 一刀切。
+func isChannelRefused(body string) bool {
+	if !strings.Contains(strings.ToLower(body), accountRestrictedMsg) {
+		return false
+	}
+	return hasBusinessCode(body, "11-128")
 }
 
 // contentBlockedMarkers 内容策略拦截关键词（大小写不敏感子串匹配）。
@@ -240,40 +280,73 @@ func IsModelRateLimit(body string) bool {
 // modelBlockCode 明确指向「该后端无此模型」的业务 code。
 const modelBlockCode = "11102"
 
+// modelForbiddenCode 明确指向「该账号类型无权使用该模型」的业务 code。
+// 同一模型在不同账号类型上权限不同，因此与 11102 同属 (账号, 模型) 级
+// 负缓存：换有权限的账号仍可能成功，全部账号都拒绝时再向客户端报模型不可用。
+const modelForbiddenCode = "11158"
+
 // modelBlockMsgMarker 11102 答复的确定性文案（官方 error message 固定短语）。
 // 只收这个窄短语，不收 "model ... not found" 宽正则——后者会误伤其他业务的
 // not found 措辞。
 const modelBlockMsgMarker = "service info not found"
+
+const modelForbiddenMsgMarker = "is not allowed for user type"
 
 // ModelBlockReason 11102 负缓存条目在 pool.modelCooldowns 里的 reason 前缀。
 // handler 写 BlockModelBackoff；pool.BlockModelClear 按 "11102" 前缀识别条目
 // （与 6004 条目的 "6004 model rate limit" reason 互不干扰）。
 const ModelBlockReason = "11102 model not available"
 
-// IsModelBlocked 报告 body 是否是「该后端无此模型」(11102) 的确定性答复。
+// ModelForbiddenReason 11158 负缓存条目的 reason 前缀。
+// pool.BlockModelClear 同时识别 11102/11158 两种确定性的模型级拒绝。
+const ModelForbiddenReason = "11158 model not allowed for account type"
+
+// IsModelBlocked 报告 body 是否是「该后端无此模型」(11102) 或「该账号类型无权
+// 使用该模型」(11158) 的确定性答复。
 //
 // 只比对 code/msg 等独立字段，绝不做整段文本子串匹配：错误体还带 requestId 等字段，
-// 拿整段文本匹配会把 "11102" 撞在 ID 上、误避让一个本来能用的模型。判定 =
-// code 字段精确等于 "11102"，或 msg/message 字段命中窄短语 "service info not
-// found"（两者任一命中即真）。只看 400/404：429 带 11102 属限流语义。
+// 拿整段文本匹配会把 code 撞在 ID 上、误避让一个本来能用的模型。判定 =
+// code 字段精确等于 "11102"/"11158"，或 msg/message 字段命中对应窄短语。
+// 只看 400/404：429 带这些 code 仍属限流语义。
 // 字段遍历覆盖顶层与 error 子对象两层。
 func IsModelBlocked(status int, body string) bool {
 	if (status != http.StatusBadRequest && status != http.StatusNotFound) || body == "" {
 		return false
 	}
-	// 轻量预检：body 既无 "11102" 又无 marker 时直接短路（大多数 4xx 零分配返回）。
-	if !strings.Contains(body, modelBlockCode) && !strings.Contains(strings.ToLower(body), modelBlockMsgMarker) {
+	lower := strings.ToLower(body)
+	// 轻量预检：body 无任何已知 code/marker 时直接短路（大多数 4xx 零分配返回）。
+	if !strings.Contains(body, modelBlockCode) && !strings.Contains(body, modelForbiddenCode) &&
+		!strings.Contains(lower, modelBlockMsgMarker) && !strings.Contains(lower, modelForbiddenMsgMarker) {
 		return false
 	}
+	code, msg := modelBlockFields(body)
+	if code == modelBlockCode || code == modelForbiddenCode {
+		return true
+	}
+	lowerMsg := strings.ToLower(msg)
+	return strings.Contains(lowerMsg, modelBlockMsgMarker) || strings.Contains(lowerMsg, modelForbiddenMsgMarker)
+}
+
+// ModelBlockReasonFor 返回确定性模型拒绝对应的负缓存 reason。
+// 11158 是账号类型权限问题；其余已由 IsModelBlocked 确认的形态沿用 11102。
+func ModelBlockReasonFor(body string) string {
+	code, msg := modelBlockFields(body)
+	if code == modelForbiddenCode || strings.Contains(strings.ToLower(msg), modelForbiddenMsgMarker) {
+		return ModelForbiddenReason
+	}
+	return ModelBlockReason
+}
+
+// modelBlockFields 提取顶层或 error 子对象中的业务 code 与消息。
+func modelBlockFields(body string) (code, msg string) {
 	var root map[string]any
 	if err := json.Unmarshal([]byte(body), &root); err != nil {
-		return false
+		return "", ""
 	}
 	nodes := []map[string]any{root}
 	if inner, ok := root["error"].(map[string]any); ok {
 		nodes = append(nodes, inner)
 	}
-	code, msg := "", ""
 	for _, node := range nodes {
 		for _, key := range []string{"code", "errCode", "error_code"} {
 			if v, ok := node[key]; ok && v != nil && code == "" {
@@ -286,10 +359,7 @@ func IsModelBlocked(status int, body string) bool {
 			}
 		}
 	}
-	if code == modelBlockCode {
-		return true
-	}
-	return strings.Contains(strings.ToLower(msg), modelBlockMsgMarker)
+	return code, msg
 }
 
 // hasBusinessCode reports whether a JSON error envelope contains an exact
@@ -467,25 +537,31 @@ func ParseRateReset(body string) (time.Time, bool) {
 //     14017 trial not activated register 未完成）。必须先于 status==429 判定：
 //     14017 常带 429 状态码，若落到 status==429 会误归 soft_rate（"限流"语义不符：
 //     限流可指数退避等自愈，账号级故障等不来）。11140 的 model 级限流变体
-//     （rate-limiting 文案）因 marker 不含该文案而天然落到 softRateMarkers 层，
-//     不受影响。
+//     （rate-limiting 文案）因 IsAccountRestricted 要求 "request illegal" 文案
+//     而不命中，天然落到 softRateMarkers 层，不受影响。
+//     同一层先按业务码分流 11128 通道校验失败（文案同为 "request illegal"）：
+//     那是客户端指纹/通道问题，账号本身健康，归 ErrChannelRefused 不罚号。
 //  4. 429 + code 14018 —— 明确的账号积分耗尽，归 ErrHardCredit（issue #175）。
 //     只认结构化业务码，不靠可能跨计费/限流两界的文案猜测。
-//  5. status==429 —— 限流状态码兜底（先于 hardMarkers）：429 body 高频携带
+//  5. 429 + 6021 queue.full —— 渠道级容量满载（上游集群排队打满），归
+//     ErrUpstreamBusy：非账号问题，不罚号不轮转（2026-10-15 实案：按限流处置
+//     2 秒绞杀整池 DeepSeek 号）。判在 status==429 兜底**之前**——它是比
+//     「限流」更具体的渠道级信号（同 14018 的具体优先哲学）。
+//  6. status==429 —— 限流状态码兜底（先于 hardMarkers）：429 body 高频携带
 //     "quota exceeded"/"额度不足" 等跨计费/限流两界的措辞，hardMarkers 先判会把
 //     限流误归 ErrHardCredit 硬冷却到次日 04:00，白扔号约 12h。状态码是比关键词
 //     更权威的信号；真正的余额耗尽由 402（第 1 层）或 14018（第 4 层）捕获，
-//     非 429 状态码的 quota 措辞仍走下方 hardMarkers（第 6 层）。
-//  6. hardMarkers —— 非 429 响应携带计费关键词（200 业务信封 / 403 信封等）。
-//  7. softRateMarkers —— 非 429 状态码携带限流文案（issue #28 修复点）。
+//     非 429 状态码的 quota 措辞仍走下方 hardMarkers（第 7 层）。
+//  7. hardMarkers —— 非 429 响应携带计费关键词（200 业务信封 / 403 信封等）。
+//  8. softRateMarkers —— 非 429 状态码携带限流文案（issue #28 修复点）。
 //     位于此处可覆盖 200/400/403/5xx 各状态码。
-//  8. 11115 —— 「prompt is too long」请求级语义：判在 404/5xx 与通用 4xx 兜底
+//  9. 11115 —— 「prompt is too long」请求级语义：判在 404/5xx 与通用 4xx 兜底
 //     之前（404 上打 11115 若落 ErrNotFound 会误冷却账号——上下文超限与账号无关）。
-//  9. 404 / 5xx —— 与限流无关的常规分类。
-//  10. IsWafBlocked —— 403 且无业务信封（HTML 拦截页/空体/纯文本）：APISIX WAF
+//  10. 404 / 5xx —— 与限流无关的常规分类。
+//  11. IsWafBlocked —— 403 且无业务信封（HTML 拦截页/空体/纯文本）：APISIX WAF
 //     拦截形态。判在通用 4xx 兜底**之前**：此前该形态落 ErrClient → 只换号不罚 →
 //     连环 403。带业务信封的 403 已被上方各层捕获，走不到本层。
-//  11. 内容策略/参数错误/其他 4xx —— 通用兜底。
+//  12. 内容策略/参数错误/其他 4xx —— 通用兜底。
 func Classify(status int, body string) ErrKind {
 	// 11102「该后端无此模型」须最先判：它是「模型在后端不存在」的确定性答复，语义比
 	// 计费/限流都更具体——若不先判，msg 里的 "service info not found" 会被更宽的
@@ -507,6 +583,18 @@ func Classify(status int, body string) ErrKind {
 			return ErrSessionDead
 		}
 	}
+	// WorkBuddy 11128 / 11140 的 msg 同为 "request illegal"，必须按业务码分流：
+	//   - 11128 = 通道校验失败（displayTips: 可能不是官方客户端发送）→ 账号健康，
+	//     不罚号。误判成 account_fault 会硬禁用正常账号（issue 1849 同款误伤）。
+	//   - 11140 = 账号被上游限制（异常行为/风控）→ account_fault，由 handler 禁用。
+	// 两者都要求 code + 文案双条件，避免 11140 的模型级限流变体被误判（见
+	// IsAccountRestricted 注释）。
+	if isChannelRefused(body) {
+		return ErrChannelRefused
+	}
+	if IsAccountRestricted(body) {
+		return ErrAccountFault
+	}
 	for _, m := range accountFaultMarkers {
 		if strings.Contains(lower, strings.ToLower(m)) || strings.Contains(body, m) {
 			return ErrAccountFault
@@ -517,6 +605,15 @@ func Classify(status int, body string) ErrKind {
 	// 判定；无该 code 的 "credits exhausted" 文案仍保持普通 429 的软限流语义。
 	if status == http.StatusTooManyRequests && hasBusinessCode(body, "14018") {
 		return ErrHardCredit
+	}
+	// 6021「queue.full.title」是**渠道级容量满载**（上游推理集群排队队列打满），
+	// 不是账号问题：同一时刻换任何账号都会撞同一堵墙。必须先于通用 429 兜底，
+	// 否则会按 ErrSoftRate 逐号软冷却——实测 2 秒内即可把整池健康号全部误杀
+	// 冷却（2026-10-15 实案），且换号白撞放大请求量。429 + 结构化 code 为主判据
+	// （与 14018 同口径）；"queue.full" 固定文案单列为外卡——该文案是上游 i18n
+	// key 原文，语义唯一，非 429 状态码出现同样归本类（防上游换状态码）。
+	if (status == http.StatusTooManyRequests && hasBusinessCode(body, "6021")) || isQueueFullBody(lower) {
+		return ErrUpstreamBusy
 	}
 	// status==429 先于 hardMarkers：限流响应 body 高频携带 "quota exceeded"/
 	// "额度不足" 等跨计费/限流两界的措辞，hardMarkers 先判会把限流误归
@@ -681,7 +778,24 @@ type Client struct {
 	// false 时即便用户 auth 写了 realm=global 也**不**路由到 global base——
 	// chatBase/billingBase 返回 CN base，路径也走 CN（双保险，与 auth.Realm() 的开关闸呼应）。
 	GlobalEnabled bool
+
+	// refreshMu/refreshInFlight 同账号 refresh 单飞（按 UID 分桶）：同一时刻只允许
+	// 一个 refresh 在途，其余调用等待并复用首个结果。上游对 refreshToken 反重放，
+	// 并发第二发会带着已被消费的 RT 撞 12153 并整链作废（issue #215：账号从此恒
+	// 401，只能人工重登）。单飞在这里是保号手段，不只是省流量。
+	refreshMu       sync.Mutex
+	refreshInFlight map[string]*refreshFlight
+
+	// creditObserver 余额查询观察者（见 CreditObserver / SetCreditObserver）。
+	// atomic：启动期挂载、运行期并发读，不参与任何出站决策。
+	creditObserver atomic.Pointer[CreditObserver]
 }
+
+// CreditObserver 余额查询观察者：每次**真实查到**余额后回调（uid + 余额绝对值）。
+// 旁路通知，不改变任何透传字节；未挂载时零开销。用于积分历史留痕
+// （internal/credithist）：余额查询是"积分变动"唯一可靠的观测口——签到 / 活跃
+// 上报等渠道上游不落金额日志，只能靠比对余额覆盖。
+type CreditObserver func(uid string, credits int64)
 
 // New 生产默认值。Transport 由 newTransport() 集中构造（连接层加固：真正禁 h2 /
 // TLS 握手超时 / 短 keepalive 探测 / 失败清池，参数见 transport.go——吸收上游
@@ -901,13 +1015,92 @@ const refreshTokenExpiresInMax = 10 * 365 * 24 * time.Hour
 // RefreshToken 刷新 access token；成功时更新 a 的字段（缺省值保留旧值），
 // 调用方负责 SaveAtomic。
 //
-// 并发安全模型（两段式，缩小持锁窗口）：
-//   - 锁内仅做「读 refreshToken 快照」与「校验未变后写回新 token」两小段内存操作；
-//   - 网络 I/O（doJSON）在**锁外**执行，带 30s ctx 超时——避免上游 hang 时长时间
-//     独占 a.mu，阻塞同账号的 SaveAtomic / 其他刷新（issue:持锁 120s I/O）。
-//   - 写回前重新校验快照一致性：若锁外期间另一 goroutine 已完成刷新（refreshToken
-//     已变），本次结果直接采用（新 token 已生效），不再重复写回。
+// 并发安全模型（单飞 + 两段式）：
+//   - **单飞**：同一账号（UID）同一时刻只允许一个 refresh 在途，其余调用等待并
+//     原样复用首个结果。上游对 refreshToken 有反重放：RT 被消费后再用会撞 12153
+//     （refresh token is invalid）并把整条 RT 链作废，账号从此恒 401、只能人工
+//     重新登录（issue #215：scheduler keepalive / handler 临近过期刷新 / signin
+//     会并发触发同一账号）。所以单飞在这里是保号手段，而不只是省流量。
+//   - 首个调用内部仍是两段式：锁内读快照 → 锁外 I/O（30s）→ 锁内校验快照一致后
+//     写回；写回前若发现另一刷新已完成（两 token 同时变化）则直接采用。
+//   - 12153 兜底：若磁盘 auth 文件已被其他进程（server + signin 双进程部署）刷新
+//     过，则采纳磁盘 token 重试一次——进程内单飞挡不住跨进程竞态。
 func (c *Client) RefreshToken(a *auth.Auth) error {
+	key := a.UID
+	if key == "" {
+		// 无 UID 的临时 auth：退化为按对象指针去重，仍保证同一对象串行。
+		key = fmt.Sprintf("%p", a)
+	}
+	c.refreshMu.Lock()
+	if c.refreshInFlight == nil {
+		c.refreshInFlight = make(map[string]*refreshFlight)
+	}
+	if f, ok := c.refreshInFlight[key]; ok {
+		c.refreshMu.Unlock()
+		<-f.done
+		return f.err
+	}
+	f := &refreshFlight{done: make(chan struct{})}
+	c.refreshInFlight[key] = f
+	c.refreshMu.Unlock()
+
+	err := c.refreshTokenOnce(a)
+	if err != nil && isSessionDead(err) && adoptNewerTokensFromDisk(a) {
+		// 跨进程竞态：磁盘 RT 已被别的进程 rotate 过，用新 RT 再试一次。
+		err = c.refreshTokenOnce(a)
+	}
+
+	// 先写结果再关 channel：等待者 <-f.done 之后读到的一定是最终 err。
+	f.err = err
+	close(f.done)
+	c.refreshMu.Lock()
+	delete(c.refreshInFlight, key)
+	c.refreshMu.Unlock()
+	return err
+}
+
+// refreshFlight 是同一账号一次 refresh 的单飞票据：done 关闭即结果就绪。
+type refreshFlight struct {
+	done chan struct{}
+	err  error
+}
+
+// isSessionDead 判定错误是否为上游 12153（会话 / RT 失效）。
+func isSessionDead(err error) bool {
+	var ue *Error
+	return errors.As(err, &ue) && ue.Kind == ErrSessionDead
+}
+
+// adoptNewerTokensFromDisk 在 refresh 失败后读回 auth 文件：若磁盘 RT 与内存不同
+// （另一进程已刷新并写回），采纳磁盘 token 并返回 true，供调用方重试一次。
+// 读文件失败、解析失败、RT 一致均返回 false（不改内存状态），保持失败语义。
+func adoptNewerTokensFromDisk(a *auth.Auth) bool {
+	if a.FilePath == "" {
+		return false
+	}
+	raw, err := os.ReadFile(a.FilePath)
+	if err != nil {
+		return false
+	}
+	disk, err := auth.Parse(raw)
+	if err != nil || strings.TrimSpace(disk.RefreshToken) == "" {
+		return false
+	}
+	a.Lock()
+	defer a.Unlock()
+	if disk.RefreshToken == a.RefreshToken {
+		return false
+	}
+	a.AccessToken = disk.AccessToken
+	a.RefreshToken = disk.RefreshToken
+	if disk.ExpiresAt > 0 {
+		a.ExpiresAt = disk.ExpiresAt
+	}
+	return true
+}
+
+// refreshTokenOnce 是单次刷新本体（调用方 RefreshToken 已保证同账号串行）。
+func (c *Client) refreshTokenOnce(a *auth.Auth) error {
 	// 第 1 段（锁内）：读快照。
 	a.Lock()
 	rtSnapshot := a.RefreshToken
@@ -1808,6 +2001,33 @@ type CreditPackage struct {
 	Cycle bool `json:"cycle,omitempty"`
 }
 
+// ExpiryBucket 单个自然日到期的积分合计（按真实失效时刻 DeductionEndTime 聚合）。
+// 面板首页「积分到期提醒」快照与「检查」（逐包明细）共用同一口径：
+//   - Date 为该日（UTC+8，YYYY-MM-DD），前端按这个日期分组展示；
+//   - ExpireAt 是该日最早一批的精确时刻，供「最早到期优先」选号路由使用；
+//   - Remain 是该日所有正余额包的剩余量之和。
+type ExpiryBucket struct {
+	Date     string    `json:"date"`
+	ExpireAt time.Time `json:"expires_at,omitempty"`
+	Remain   int64     `json:"remain"`
+}
+
+// packageEffectiveEnd 返回套餐的真实失效时刻：DeductionEndTime（可抵扣窗口结束，
+// epoch 毫秒）优先，缺失依次回落 ExpiredTime / PackageEndTime / CycleEndTime。
+// 与 CreditPackages 的字段优先级必须一致——快照与逐包明细两条路径口径分叉过一次
+// （快照把体验版的周期重置日 10-31 当成到期日，实际 DeductionEndTime 在 2035 年）。
+func packageEffectiveEnd(deductionEndMS int64, expired, packageEnd, cycleEnd string) (time.Time, bool) {
+	if deductionEndMS > 0 {
+		return time.UnixMilli(deductionEndMS).In(softRateResetLoc), true
+	}
+	for _, raw := range []string{expired, packageEnd, cycleEnd} {
+		if t, ok := parsePackageEndTime(raw); ok {
+			return t, true
+		}
+	}
+	return time.Time{}, false
+}
+
 // CreditPackages 返回账号当前的逐包构成。remain/size 为各包求和。
 //
 // 字段选择与 UserResourceDetailed 的聚合口径一致：CycleCapacitySize > 0 时按
@@ -1870,25 +2090,19 @@ func (c *Client) CreditPackages(a *auth.Auth) ([]CreditPackage, int64, int64, er
 			SubProductCode: p.SubProductCode,
 			SubProductName: p.SubProductName,
 		}
-		// 到期时刻：优先 DeductionEndTime（可抵扣窗口结束，真「用不完就没了」；
-		// ExpiresAt 直接用原始毫秒——RFC3339 不是 packageEndLayout 形态，交给下方
-		// 解析会静默失败得 0），缺失依次回落 ExpiredTime / PackageEndTime /
-		// CycleEndTime（周期边界兜底）。全空 = 长期包（前端显示 —）。
+		// EndTime 先给一个可读回落值（解析失败时前端仍可按字符串取日期）；
+		// 真实失效时刻统一由 packageEffectiveEnd 判定，与快照路径同口径。
 		switch {
-		case p.DeductionEndTime > 0:
-			cp.EndTime = time.UnixMilli(p.DeductionEndTime).Format(time.RFC3339)
-			cp.ExpiresAt = p.DeductionEndTime
 		case p.ExpiredTime != "":
 			cp.EndTime = p.ExpiredTime
 		case p.PackageEndTime != "":
 			cp.EndTime = p.PackageEndTime
-		default:
+		case p.CycleEndTime != "":
 			cp.EndTime = p.CycleEndTime
 		}
-		if cp.ExpiresAt == 0 && cp.EndTime != "" {
-			if end, perr := time.ParseInLocation(packageEndLayout, cp.EndTime, softRateResetLoc); perr == nil {
-				cp.ExpiresAt = end.UnixMilli()
-			}
+		if end, ok := packageEffectiveEnd(p.DeductionEndTime, p.ExpiredTime, p.PackageEndTime, p.CycleEndTime); ok {
+			cp.EndTime = end.Format(time.RFC3339)
+			cp.ExpiresAt = end.UnixMilli()
 		}
 		// CreateTime 是 epoch 毫秒；0 表示上游没给，留空而不是伪造 1970。
 		if p.CreateTime > 0 {
@@ -2054,13 +2268,35 @@ func (c *Client) enterpriseResource(a *auth.Auth, soon time.Duration) (remain, t
 }
 
 // UserResourceDetailedWithExpiry 在 UserResourceDetailed 基础上返回最早未来到期批次：
-// earliestAt 是最早的可用到期时刻，earliestRemaining 是同一时刻所有正余额包的剩余量之和。
-// 已过期、剩余为 0、缺少或无法解析到期时间的包都不会成为最早批次；无有效批次时返回零值。
+// earliestAt 是最早的可用到期时刻，earliestRemaining 是该自然日全部正余额包的剩余量
+// 之和（与面板「检查」按日汇总的口径一致）。已过期、剩余为 0、缺少或无法解析到期时间
+// 的包都不会成为最早批次；无有效批次时返回零值。
 func (c *Client) UserResourceDetailedWithExpiry(a *auth.Auth, soon time.Duration) (remain, total, expiring int64, earliestAt time.Time, earliestRemaining int64, err error) {
+	remain, total, expiring, earliestAt, earliestRemaining, _, err = c.UserResourceSnapshot(a, soon)
+	return
+}
+
+// UserResourceSnapshot 在 UserResourceDetailedWithExpiry 基础上额外返回按自然日聚合的
+// 到期批次（buckets）。日期/剩余量口径与面板「检查」（CreditPackages 前端按日汇总）
+// 完全一致，首页快照据此可零上游请求渲染出同样的内容。
+//
+// 关键：到期时刻统一走 packageEffectiveEnd（DeductionEndTime 优先）。此前本函数只读
+// CycleEndTime，把「个人体验版」的月度周期重置日（如 2026-10-31）当成了到期日，而它
+// 真实的可抵扣窗口到 2034/2035 年——首页快照因此长期错报最近到期时间与数量。
+func (c *Client) UserResourceSnapshot(a *auth.Auth, soon time.Duration) (remain, total, expiring int64, earliestAt time.Time, earliestRemaining int64, buckets []ExpiryBucket, err error) {
 	// 企业版额度不在「个人资源包」体系内：get-user-resource* 对 enterpriseId 非空账号
 	// 恒返回空 Accounts（实测 code 0 且 Accounts null），故分流到企业口径端点。
 	if a.IsEnterprise() {
-		return c.enterpriseResource(a, soon)
+		remain, total, expiring, earliestAt, earliestRemaining, err = c.enterpriseResource(a, soon)
+		if err == nil && earliestRemaining > 0 && !earliestAt.IsZero() && earliestAt.After(time.Now()) {
+			buckets = []ExpiryBucket{{
+				Date:     earliestAt.In(softRateResetLoc).Format("2006-01-02"),
+				ExpireAt: earliestAt,
+				Remain:   earliestRemaining,
+			}}
+		}
+		c.notifyCredits(a, remain, err)
+		return
 	}
 	now := time.Now()
 	body := map[string]any{
@@ -2080,7 +2316,7 @@ func (c *Client) UserResourceDetailedWithExpiry(a *auth.Auth, soon time.Duration
 		return e
 	})
 	if err != nil {
-		return 0, 0, 0, time.Time{}, 0, err
+		return 0, 0, 0, time.Time{}, 0, nil, err
 	}
 	var resp struct {
 		Response struct {
@@ -2088,6 +2324,9 @@ func (c *Client) UserResourceDetailedWithExpiry(a *auth.Auth, soon time.Duration
 				Accounts []struct {
 					PackageName         string `json:"PackageName"`
 					CycleEndTime        string `json:"CycleEndTime"` // "2006-01-02 15:04:05"，缺省/空 = 无到期
+					ExpiredTime         string `json:"ExpiredTime"`
+					PackageEndTime      string `json:"PackageEndTime"`
+					DeductionEndTime    int64  `json:"DeductionEndTime"` // 可抵扣窗口结束（epoch 毫秒），真失效时刻
 					CapacitySize        int64  `json:"CapacitySize"`
 					CapacityRemain      int64  `json:"CapacityRemain"`
 					CapacityUsed        int64  `json:"CapacityUsed"`
@@ -2099,8 +2338,9 @@ func (c *Client) UserResourceDetailedWithExpiry(a *auth.Auth, soon time.Duration
 		} `json:"Response"`
 	}
 	if err := json.Unmarshal(data, &resp); err != nil {
-		return 0, 0, 0, time.Time{}, 0, fmt.Errorf("resource parse: %w", err)
+		return 0, 0, 0, time.Time{}, 0, nil, fmt.Errorf("resource parse: %w", err)
 	}
+	byDate := make(map[string]*ExpiryBucket)
 	for _, acct := range resp.Response.Data.Accounts {
 		r, _, size := packageRemainUsed(respAccount{
 			CapacityRemain:      acct.CapacityRemain,
@@ -2121,22 +2361,76 @@ func (c *Client) UserResourceDetailedWithExpiry(a *auth.Auth, soon time.Duration
 		if r <= 0 {
 			continue
 		}
-		end, ok := parsePackageEndTime(acct.CycleEndTime)
+		end, ok := packageEffectiveEnd(acct.DeductionEndTime, acct.ExpiredTime, acct.PackageEndTime, acct.CycleEndTime)
 		if !ok || !end.After(now) {
 			continue
 		}
 		if earliestAt.IsZero() || end.Before(earliestAt) {
 			earliestAt = end
-			earliestRemaining = r
-		} else if end.Equal(earliestAt) {
-			earliestRemaining += r
 		}
+		// 按自然日（UTC+8）聚合：与 CreditPackages → 前端 end_time.slice(0,10) 同口径。
+		day := end.In(softRateResetLoc).Format("2006-01-02")
+		b, seen := byDate[day]
+		if !seen {
+			b = &ExpiryBucket{Date: day, ExpireAt: end}
+			byDate[day] = b
+		} else if end.Before(b.ExpireAt) {
+			b.ExpireAt = end
+		}
+		b.Remain += r
 		// 分桶：仅 soon>0 且确实在窗口内 → expiring。
 		if soon > 0 && !end.After(now.Add(soon)) {
 			expiring += r
 		}
 	}
-	return remain, total, expiring, earliestAt, earliestRemaining, nil
+	dates := make([]string, 0, len(byDate))
+	for d := range byDate {
+		dates = append(dates, d)
+	}
+	sort.Strings(dates)
+	buckets = make([]ExpiryBucket, 0, len(dates))
+	for _, d := range dates {
+		buckets = append(buckets, *byDate[d])
+	}
+	// earliestRemaining 是该自然日全部正余额包的合计（不是单个包的剩余量）。
+	if len(buckets) > 0 {
+		earliestRemaining = buckets[0].Remain
+	}
+	c.notifyCredits(a, remain, nil)
+	return remain, total, expiring, earliestAt, earliestRemaining, buckets, nil
+}
+
+// SetCreditObserver 挂载/注销（nil）余额观察者。可在启动后任意时刻调用；
+// 观察者必须自身并发安全且快速返回——它在余额查询的调用栈上同步执行。
+func (c *Client) SetCreditObserver(fn CreditObserver) {
+	if c == nil {
+		return
+	}
+	if fn == nil {
+		c.creditObserver.Store(nil)
+		return
+	}
+	c.creditObserver.Store(&fn)
+}
+
+// notifyCredits 查询成功（err == nil）后旁路通知观察者。失败不是观测值：
+// 网络抖动返回的 0 余额若被留痕，会在下一次成功时造出一条假变动。
+func (c *Client) notifyCredits(a *auth.Auth, credits int64, err error) {
+	if c == nil || err != nil || a == nil {
+		return
+	}
+	fn := c.creditObserver.Load()
+	if fn == nil {
+		return
+	}
+	// 观察者是纯旁路：它 panic 绝不能打断余额刷新/签到这条主流程（调度器 goroutine
+	// 里未恢复的 panic 会直接带走整个进程）。与"落盘失败只记日志"同一哲学。
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("WARN: [upstream] 余额观察者 panic 已忽略: %v", r)
+		}
+	}()
+	(*fn)(a.UID, credits)
 }
 
 // respAccount 供 packageRemainUsed 解析的套餐字段（CreditPackages 的逐包结构同构）。

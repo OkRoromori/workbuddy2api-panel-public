@@ -10,6 +10,7 @@ package server
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -365,9 +366,12 @@ func (s *chatStatsReader) parseSSELine(line string) {
 }
 
 // CacheTokens 返回末帧 usage 的缓存命中 / 未命中 token 数。miss 缺失时按
-// prompt - hit 推导；hit 与 miss 均不可得时 ok=false（不参与命中率统计）。
+// prompt - hit 推导；对称地，miss 显式存在而 hit 为 0 / 缺失时按 prompt - miss
+// 反推 hit（issue #170：上游在「接近全命中」时可能回 hit=0 + miss=3 这类组合，
+// 不反推会被误判为整段未命中）。两个方向都推导不出时 ok=false（不参与命中率
+// 统计）。
 func (s *chatStatsReader) CacheTokens() (hit, miss int64, ok bool) {
-	if !s.hasCacheHit {
+	if !s.hasCacheHit && !s.hasCacheMiss {
 		return 0, 0, false
 	}
 	hit = int64(s.cacheHit)
@@ -377,6 +381,10 @@ func (s *chatStatsReader) CacheTokens() (hit, miss int64, ok bool) {
 			return hit, 0, true
 		}
 		miss = int64(s.promptTokens - s.cacheHit)
+	} else if s.cacheHit == 0 && s.hasPromptTokens && s.promptTokens > s.cacheMiss {
+		// hit 为 0 / 缺失但 miss 可信（prompt > miss，即确有命中量）→ 反推。
+		// prompt <= miss 时保持 hit=0，那是真实的整段未命中。
+		hit = int64(s.promptTokens - s.cacheMiss)
 	}
 	return hit, miss, true
 }
@@ -432,6 +440,25 @@ func parseModelFromBody(body []byte) string {
 		return "-"
 	}
 	return obj.Model
+}
+
+// cacheTokensFromUsage 从非流式聚合响应的 usage 里提取缓存命中 / 未命中 token
+// 数，与流式侧 CacheTokens 的推导口径对称：hit 不可得（缺失或 0）但 miss 显式
+// 存在时，按 prompt - miss 反推 hit（issue #170）；prompt <= miss 时保持 hit=0
+// （真实的整段未命中）。两个方向都不可得时 ok=false。
+func cacheTokensFromUsage(usage map[string]any) (hit, miss int64, ok bool) {
+	h, okH := upstream.UsageCacheHitTokens(usage)
+	m, okM := upstream.UsageCacheMissTokens(usage)
+	switch {
+	case okH:
+		return int64(h), int64(m), true
+	case okM:
+		if p, okP := upstream.UsagePromptTokens(usage); okP && p > m {
+			return int64(p - m), int64(m), true
+		}
+		return 0, int64(m), true
+	}
+	return 0, 0, false
 }
 
 // usageDeltaFromResponse 从非流式聚合响应中提取明确存在的 token 字段（pool 口径）。
@@ -502,6 +529,14 @@ type requestTraceKey struct{}
 type requestTrace struct {
 	id    string
 	start time.Time
+	// path 实际请求路径（chat / search / search messages）。此前 Path 在 event() 里
+	// 硬编码为 /v1/chat/completions，搜索接入后必须按真实路径记账。
+	path string
+	// account 本次请求实际使用的账号（搜索路径没有 chatStat，单独记录）。
+	account string
+	// model 非 chat 路径的模型标识（搜索写 "WorkBuddy搜索工具"）。chat 路径由
+	// chatStat.model 覆盖，二者不会同时生效。
+	model string
 	stat  *chatStat
 	// 调用来源，进入 handler 时一次性采集（见 ServeHTTP / captureClientInfo）。
 	clientIP  string
@@ -550,16 +585,35 @@ func requestTraceFrom(r *http.Request) *requestTrace {
 	if r == nil {
 		return nil
 	}
-	tr, _ := r.Context().Value(requestTraceKey{}).(*requestTrace)
+	return requestTraceFromContext(r.Context())
+}
+
+// requestTraceFromContext 从 context 取 trace。搜索路径在 upstream 层之外拿不到
+// *http.Request（runSearch 只持有 ctx），故单独提供 context 版本。
+func requestTraceFromContext(ctx context.Context) *requestTrace {
+	if ctx == nil {
+		return nil
+	}
+	tr, _ := ctx.Value(requestTraceKey{}).(*requestTrace)
 	return tr
 }
 
 func (t *requestTrace) event(status int) reqlog.Event {
+	path := t.path
+	if path == "" {
+		path = "/v1/chat/completions"
+	}
 	e := reqlog.Event{
 		Time:      t.start,
 		RequestID: t.id,
-		Path:      "/v1/chat/completions",
+		Path:      path,
 		Status:    status,
+	}
+	if t.account != "" {
+		e.Account = t.account
+	}
+	if t.model != "" {
+		e.Model = t.model
 	}
 	duration := time.Since(t.start)
 	e.DurationMs = duration.Milliseconds()
@@ -569,6 +623,7 @@ func (t *requestTrace) event(status int) reqlog.Event {
 	if t.stat != nil {
 		s := t.stat
 		e.Account = logfmt.Label(s.uid, s.nick)
+		// chat 路径以 stat 的模型为准（覆盖 trace.model）。
 		e.Model = s.model
 		e.Outcome = s.outcome
 		e.TTFBMs = s.ttfb.Milliseconds()

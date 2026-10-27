@@ -209,6 +209,49 @@ func TestChatBadParamsFailsFastWithoutPenalty(t *testing.T) {
 	}
 }
 
+// TestChatQueueFullFailsFastWithoutPenalty 上游 429 + code 6021「queue.full.title」
+// 是渠道级容量满载（推理集群排队打满），**不是账号问题**（2026-10-15 实案：按
+// 限流逐号软冷却，2 秒绞杀整池健康号）。端到端断言：不轮转（只打一次上游）、
+// 直接回 503 + upstream_busy（可重试语义）、账号零惩罚（无冷却/无熔断/无连败）。
+func TestChatQueueFullFailsFastWithoutPenalty(t *testing.T) {
+	calls := map[string]int{}
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		calls[authz]++
+		return 429, `{"code":6021,"msg":"queue.full.title","requestId":"b1bc87ea3a771e835e388328713d47cf"}`, false
+	})
+	p := testPoolWith(
+		&auth.Auth{UID: "busy1", AccessToken: "at-busy1", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "busy2", AccessToken: "at-busy2", ExpiresAt: 9999999999},
+	)
+	p.SetCredits("busy1", 2000, 0) // 确定性源 r=0 → 先选 busy1
+	p.SetCredits("busy2", 1000, 0)
+	h := NewHandler(Config{Pool: p, Upstream: up})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("code=%d body=%s (want 503: channel-level busy, client should back off and retry)", rec.Code, rec.Body)
+	}
+	if calls["Bearer at-busy1"] != 1 || calls["Bearer at-busy2"] != 0 {
+		t.Errorf("calls=%v want busy1 1 次、busy2 0 次（零轮转）", calls)
+	}
+	// 账号完好：无冷却、无熔断计数、无连败降权。
+	st, _ := p.Status("busy1")
+	if st.Cooling || st.Disabled || st.ErrTotal != 0 || st.BreakerFails != 0 {
+		t.Errorf("ErrUpstreamBusy must not penalize account: %+v", st)
+	}
+	// 响应体：上游原文透传（requestId 在场）+ upstream_busy code。
+	body := rec.Body.String()
+	if !strings.Contains(body, "6021") || !strings.Contains(body, "queue.full.title") {
+		t.Errorf("503 message should carry upstream 6021 info: %s", body)
+	}
+	if !strings.Contains(body, "upstream_busy") {
+		t.Errorf("503 body should carry upstream_busy code: %s", body)
+	}
+	if strings.Contains(body, "no_healthy_account") {
+		t.Errorf("channel-busy failure must not be reported as account exhaustion: %s", body)
+	}
+}
+
 // TestChatBadParams400CarriesUpstreamBody 11101 的 400 响应必须包含上游原始
 // 11101 信息（含 requestId，客户端据此排查），且不再出现空洞的 no_healthy_account。
 func TestChatBadParams400CarriesUpstreamBody(t *testing.T) {
@@ -483,6 +526,49 @@ func TestApplyErrorPolicyNotFoundUsesFixedBase(t *testing.T) {
 			t.Errorf("call %d: 404 cool_remaining_sec=%d want ~%d（固定基数 %ds，非 soft_rate）",
 				i, st.CoolRemaining, notFoundSec, notFoundSec)
 		}
+	}
+}
+
+// TestApplyErrorPolicyChannelRefusedDoesNotDisable 11128 与 11140 的 msg 同为
+// "request illegal"，但语义相反：
+//   - 11128 通道校验失败 → 账号健康（官方客户端可正常使用），不得禁用/冷却；
+//   - 11140 账号被上游限制 → 硬禁用，等用户在 WorkBuddy 申诉解除；
+//   - 11140 的模型级限流变体 → 仍是软限流，不能误禁用。
+//
+// 回归点：只看文案的旧实现会把 11128 判成账号封禁，硬禁用健康账号（issue 1849
+// 同款误伤：用户官方客户端能用，面板里却被标成 banned）。
+func TestApplyErrorPolicyChannelRefusedDoesNotDisable(t *testing.T) {
+	cases := []struct {
+		name         string
+		body         string
+		kind         upstream.ErrKind
+		wantDisabled bool
+		wantCooling  bool
+	}{
+		{"11128 channel refused", `{"code":"11-128","msg":"request illegal","displayTips":{"en":"This call failed channel verification, possibly because it was not sent from an official client."}}`, upstream.ErrChannelRefused, false, false},
+		{"11140 account restricted", `{"code":11140,"msg":"request illegal"}`, upstream.ErrAccountFault, true, false},
+		{"11140 rate-limiting variant", `{"code":11140,"msg":"The model provider is rate-limiting requests."}`, upstream.ErrSoftRate, false, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := upstream.Classify(400, tc.body); got != tc.kind {
+				t.Fatalf("Classify=%v want %v", got, tc.kind)
+			}
+			p := pool.New("")
+			p.Add(&auth.Auth{UID: "u1"})
+			h := NewHandler(Config{Pool: p})
+			h.applyErrorPolicy("u1", tc.kind, tc.body, "glm-5.2", nil)
+			st, _ := p.Status("u1")
+			if st.Disabled != tc.wantDisabled {
+				t.Errorf("disabled=%v want %v (%+v)", st.Disabled, tc.wantDisabled, st)
+			}
+			if st.Cooling != tc.wantCooling {
+				t.Errorf("cooling=%v want %v (%+v)", st.Cooling, tc.wantCooling, st)
+			}
+			if !tc.wantDisabled && st.ErrTotal != 0 {
+				t.Errorf("不罚号路径不应累计错误计数: err_total=%d", st.ErrTotal)
+			}
+		})
 	}
 }
 
@@ -879,6 +965,50 @@ func TestChatHTTP4xxClientDoesNotPenalize(t *testing.T) {
 	st, _ := p.Status("u1")
 	if st.Cooling || st.ErrTotal != 0 {
 		t.Fatalf("generic 4xx should not penalize account: %+v", st)
+	}
+}
+
+// TestChatModelForbiddenByAccountTypeReturns400 复现 global:gpt-5.6-sol 在免费账号上
+// 的 11158：网关应仅轮转 global 域、写 (账号,模型) 避让，最终返回明确的 400
+// model_unavailable，而不是被 CN 账号掩盖成 503 no_healthy_account。
+func TestChatModelForbiddenByAccountTypeReturns400(t *testing.T) {
+	var calls int
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		calls++
+		return 400, `{"code":11158,"msg":"model [gpt-5.6-sol] is not allowed for user type [personal_free_user]","requestId":"req-11158"}`, false
+	})
+	p := testPoolWith(
+		&auth.Auth{UID: "cn1", Domain: "www.codebuddy.cn", AccessToken: "at-cn", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "g1", Domain: "www.workbuddy.ai", AccessToken: "at-global", ExpiresAt: 9999999999},
+	)
+	h := NewHandler(Config{Pool: p, Upstream: up})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"global:gpt-5.6-sol","messages":[]}`)))
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("code=%d want 400 body=%s", rec.Code, rec.Body)
+	}
+	if calls != 1 {
+		t.Fatalf("calls=%d want 1（只能尝试 global 账号，不能跨域轮转）", calls)
+	}
+	var resp struct {
+		Error struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("bad response JSON: %v body=%s", err, rec.Body)
+	}
+	if resp.Error.Code != "model_unavailable" {
+		t.Errorf("error.code=%q want model_unavailable", resp.Error.Code)
+	}
+	if !strings.Contains(resp.Error.Message, "11158") {
+		t.Errorf("响应应透传上游 11158 原文: %q", resp.Error.Message)
+	}
+	if st := p.ModelBlockedForRealm("gpt-5.6-sol", "global"); !st.Blocked || st.Count != 1 {
+		t.Fatalf("global 账号应写入模型级避让: %+v", st)
 	}
 }
 
@@ -1413,7 +1543,7 @@ func TestContentBlockedTriggersDegradedRetry(t *testing.T) {
 				return &http.Response{
 					StatusCode: 400,
 					Header:     http.Header{"Content-Type": []string{"application/json"}},
-					Body:       io.NopCloser(strings.NewReader(`{"code":11128,"msg":"blocked by security policy"}`)),
+					Body:       io.NopCloser(strings.NewReader(`{"code":"11-128","msg":"blocked by security policy"}`)),
 				}, nil
 			}
 			return &http.Response{
@@ -1452,7 +1582,7 @@ func TestContentBlockedStickyDegraded(t *testing.T) {
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
 		if !firstCall {
 			firstCall = true
-			return 400, `{"code":11128,"msg":"blocked by security policy"}`, false
+			return 400, `{"code":"11-128","msg":"blocked by security policy"}`, false
 		}
 		return 200, sseOK, true
 	})
@@ -1479,7 +1609,7 @@ func TestContentBlockedStickyDegraded(t *testing.T) {
 // 400 content_blocked 防火墙文案（不轮转、不暴露账号/上游错误码）。
 func TestContentBlockedCustomModeDoesNotDegrade(t *testing.T) {
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
-		return 400, `{"code":11128,"msg":"blocked by security policy"}`, false
+		return 400, `{"code":"11-128","msg":"blocked by security policy"}`, false
 	})
 	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
 	h := NewHandler(Config{Pool: p, Upstream: up, PromptMode: "custom", PromptText: "SYS"})
@@ -1504,7 +1634,7 @@ func TestContentBlockedCustomModeDoesNotDegrade(t *testing.T) {
 	}
 	// 错误透传（error-passthrough，吸收上游 5755fe3）：message 装上游 body 原文
 	// （code/msg 原样），客户端必须看到真实错误才能排查；gateway_hint 并列补充。
-	if !strings.Contains(rec.Body.String(), "11128") {
+	if !strings.Contains(rec.Body.String(), "11-128") {
 		t.Errorf("message should carry upstream original body (passthrough): %s", rec.Body.String())
 	}
 	if !strings.Contains(rec.Body.String(), "gateway_hint") {
@@ -1518,7 +1648,7 @@ func TestContentBlockedCustomModeDoesNotDegrade(t *testing.T) {
 // TestContentBlockedDoesNotPenalizeAccount ErrContentBlocked 不罚账号（无冷却/熔断/NoteError）。
 func TestContentBlockedDoesNotPenalizeAccount(t *testing.T) {
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
-		return 400, `{"code":11128,"msg":"blocked by security policy"}`, false
+		return 400, `{"code":"11-128","msg":"blocked by security policy"}`, false
 	})
 	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
 	// 熔断阈值 1：若误罚 NoteError 一次即熔断；content_blocked 不应喂熔断。
@@ -1950,5 +2080,98 @@ func TestChatMarkupRepairStrictModeRejectsUndeclaredTool(t *testing.T) {
 	msg := resp["choices"].([]any)[0].(map[string]any)["message"].(map[string]any)
 	if _, ok := msg["tool_calls"]; ok {
 		t.Fatalf("未声明的工具名不得转换: %#v", msg["tool_calls"])
+	}
+}
+
+// TestChatHiddenModelRejected models.hidden 黑名单：点名调用直接 400 拒绝，
+// 不打上游、不占选号；未隐藏的模型照常放行。
+func TestChatHiddenModelRejected(t *testing.T) {
+	var calls int
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		calls++
+		return 200, sseOK, true
+	})
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: up, ModelsHidden: []string{"glm-5.2", "global:secret-model"}})
+
+	post := func(model string) *httptest.ResponseRecorder {
+		rec := httptest.NewRecorder()
+		body := []byte(`{"model":"` + model + `","messages":[]}`)
+		h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader(body)))
+		return rec
+	}
+
+	// 裸名隐藏 → 裸名 / cn: / global: 三种写法都拒绝
+	for _, model := range []string{"glm-5.2", "cn:glm-5.2", "global:glm-5.2"} {
+		rec := post(model)
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("model %q: code=%d, want 400", model, rec.Code)
+		}
+		if !strings.Contains(rec.Body.String(), "model_unavailable") {
+			t.Errorf("model %q: body=%s, want model_unavailable", model, rec.Body.String())
+		}
+	}
+	// 前缀精确隐藏：只藏 global 域
+	if rec := post("global:secret-model"); rec.Code != http.StatusBadRequest {
+		t.Errorf("global:secret-model: code=%d, want 400", rec.Code)
+	}
+	if calls != 0 {
+		t.Errorf("hidden models must not reach upstream: calls=%d", calls)
+	}
+
+	// cn:secret-model 不在黑名单 → 放行并打到上游
+	rec := post("cn:secret-model")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("cn:secret-model: code=%d body=%s, want 200", rec.Code, rec.Body.String())
+	}
+	if calls != 1 {
+		t.Errorf("allowed model: upstream calls=%d, want 1", calls)
+	}
+}
+
+// TestModelsHiddenFiltered models.hidden 黑名单：/v1/models 列表里过滤掉隐藏模型。
+// 用包级 dynamicModelsCache 预置目录，避免联网拉取。
+func TestModelsHiddenFiltered(t *testing.T) {
+	dynamicModelsCache.Lock()
+	dynamicModelsCache.ids = []upstream.ModelInfo{{ID: "glm-5.2"}, {ID: "deepseek-v3"}}
+	dynamicModelsCache.fetched = time.Now()
+	dynamicModelsCache.Unlock()
+	defer func() {
+		dynamicModelsCache.Lock()
+		dynamicModelsCache.ids = nil
+		dynamicModelsCache.fetched = time.Time{}
+		dynamicModelsCache.lastFail = time.Time{}
+		dynamicModelsCache.Unlock()
+	}()
+
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		return 200, `{"data":[]}`, false
+	})
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: up, ModelsHidden: []string{"deepseek-v3"}})
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("GET", "/v1/models", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s, want 200", rec.Code, rec.Body.String())
+	}
+	var resp struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode /v1/models: %v", err)
+	}
+	ids := map[string]bool{}
+	for _, m := range resp.Data {
+		ids[m.ID] = true
+	}
+	// 本分支 /v1/models 下发裸名（2026-09-20 变更），域归属由 model_realm 解析。
+	if !ids["glm-5.2"] {
+		t.Errorf("visible model missing from list: ids=%v", ids)
+	}
+	if ids["deepseek-v3"] {
+		t.Errorf("hidden model leaked into /v1/models: ids=%v", ids)
 	}
 }

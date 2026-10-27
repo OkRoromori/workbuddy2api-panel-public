@@ -2,6 +2,8 @@
 wb2api
 wb2api.exe
 wb2api-*
+wb2api.new
+*.new
 *.exe
 *.bak-*
 

@@ -55,10 +55,17 @@ func GatewayHint(kind ErrKind, msg string, ctx HintContext) string {
 		return "rate limited by upstream; retry after reset"
 	case ErrAccountFault:
 		return "account-level fault at upstream (auth/quota state); the gateway will rotate or disable this account"
+	case ErrChannelRefused:
+		// 11128 通道校验失败：账号健康，问题在请求指纹/出口通道。给可操作的排查指向。
+		return "upstream rejected the request channel (it may not look like the official client); check user-agent/headers or an intercepting proxy, then retry"
 	case ErrSessionDead:
 		return "account session expired at upstream; the account is disabled until re-login"
 	case ErrHardCredit:
 		return "account credits exhausted at upstream; waiting for daily check-in to restore"
+	case ErrUpstreamBusy:
+		// 6021 queue.full：渠道级容量满载。措辞明确「不是账号问题、换号无意义」，
+		// 指引客户端等待后重试（SDK 指数退避天然适配）。
+		return "upstream capacity is full (queue.full); this is a channel-level issue, not an account problem; retry after a short wait"
 	case ErrModelBlocked:
 		return "upstream has no such model on this backend; switch model or retry on another account"
 	case ErrContentBlocked:

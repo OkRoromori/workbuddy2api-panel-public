@@ -21,7 +21,7 @@ const POLL_MS = 5000;
 // 为什么不用「WorkBuddy」当标题：那是腾讯的产品名，占在标题位等于把别人的品牌当成自己的
 //（在文档里提一句属于指称性使用，没问题；占品牌位就不一样了）。
 // 用版本标识当标题的额外好处：打开面板就知道服务器跑的是哪一版。
-const APP_NAME = 'v1.13.0-panel-main';
+const APP_NAME = 'v1.14.0-panel-main';
 // applyAppName 把显示名写进侧边栏与浏览器标签（index.html 里留的是同样的文本，
 // 无 JS 时也能看到，不至于空白）。
 function applyAppName() {
@@ -1756,7 +1756,7 @@ function go(v) {
   // 拿它当缓存标记会让「空目录」每次进来都重查一遍。
   if (v === 'models' && !mdCache.length) loadModels();
   if (v === 'config') loadConfig();
-  if (v === 'logs') loadLogs();
+  if (v === 'logs') { loadLogs(); loadCreditHistory(); }
   if (v === 'usage') loadUsage();
   if (v === 'keys') loadKeys();
   // 日志视图是全宽终端，顶栏跟着放宽，底边才和内容对齐（否则那条线比终端宽一截）。
@@ -4120,6 +4120,10 @@ $('btnKeySubmit').onclick = async () => {
 
 /* ── 配置 ─────────────────────────────────────────────────────────── */
 const CFG_MAP = {
+  strategy_domestic: ['pool', 'strategy', 'domestic'],
+  strategy_international: ['pool', 'strategy', 'international'],
+  domestic_account_order: ['pool', 'account_order', 'domestic'],
+  international_account_order: ['pool', 'account_order', 'international'],
   listen: ['listen'], api_key: ['api_key'], api_key_name: ['api_key_name'],
   checkin_hours: ['schedule', 'checkin_hours'], checkin_enabled: ['schedule', 'checkin_enabled'],
   travel_hours: ['schedule', 'travel_hours'], travel_enabled: ['schedule', 'travel_enabled'],
@@ -4127,6 +4131,7 @@ const CFG_MAP = {
   keepalive_hours: ['schedule', 'keepalive_hours'], keepalive_enabled: ['schedule', 'keepalive_enabled'],
   blackcat_hours: ['schedule', 'blackcat_hours'], blackcat_enabled: ['schedule', 'blackcat_enabled'],
   balance_refresh_enabled: ['schedule', 'balance_refresh_enabled'], balance_refresh_minutes: ['schedule', 'balance_refresh_minutes'],
+  task_sweep_enabled: ['schedule', 'task_sweep_enabled'], task_sweep_minutes: ['schedule', 'task_sweep_minutes'],
   probe_enabled: ['probe', 'enabled'], probe_interval_minutes: ['probe', 'interval_minutes'],
   probe_model: ['probe', 'model'], probe_prompt: ['probe', 'prompt'],
   probe_fail_threshold: ['probe', 'fail_threshold'],
@@ -4167,7 +4172,7 @@ async function loadConfig() {
       const v = dig(cfgLoaded, path);
       if (el.type === 'checkbox') el.checked = !!v;
       else if (Array.isArray(v)) el.value = v.join(', ');
-      else el.value = v == null ? '' : v;
+      else el.value = v == null ? (name.startsWith('strategy_') ? 'weighted_random' : '') : v;
     }
     $('cfgNote').textContent = '';
     syncAllControls(); // 自定义外观跟着刚灌进去的值刷新（不重建，只改显示）
@@ -4185,7 +4190,8 @@ function collectConfig() {
     else {
       const raw = el.value.trim();
       // 覆盖型字段空串照发（见 CLEARABLE_CFG）；其余空 = 不下发。
-      if (raw === '') v = CLEARABLE_CFG.has(name) ? '' : undefined;
+      if (name.endsWith('_account_order')) v = raw.split(/[,，\s]+/).filter(Boolean);
+      else if (raw === '') v = CLEARABLE_CFG.has(name) ? '' : undefined;
       else if (name.endsWith('_hours')) v = raw.split(/[,，\s]+/).filter(Boolean).map(Number);
       else v = raw;
     }
@@ -4341,25 +4347,224 @@ $('btnRestart').onclick = async () => {
 };
 
 /* ── 轮询 ─────────────────────────────────────────────────────────── */
+/* ── 积分历史（运行日志页下半区）────────────────────────────────────
+   数据源 /panel/api/credit_history：每次**真实查到**余额与上次快照比对，变动即留痕。
+   与请求记录互补：那边看「谁用了多少」，这边看「账上什么时候多/少了多少」。
+   纯格式化函数集中在此，便于前端测试按切片断言；变动列 +N / −N（U+2212）。 */
+function creditNum(n) {
+  return Number(n || 0).toLocaleString('zh-CN');
+}
+function creditDeltaText(delta) {
+  const d = Number(delta || 0);
+  if (d > 0) return '+' + creditNum(d);
+  if (d < 0) return '−' + creditNum(-d);
+  return '0';
+}
+function creditTimeText(e) {
+  if (!e || !e.time) return '—';
+  const d = new Date(e.time);
+  return isNaN(d.getTime()) ? '—' : d.toLocaleTimeString('zh-CN', { hour12: false });
+}
+function creditAccountText(e) {
+  e = e || {};
+  return e.account ? String(e.account) : (e.uid || '—');
+}
+function creditBalanceText(e) {
+  return creditNum(e && e.after);
+}
+function creditDescText(e) {
+  return '余额 ' + creditNum(e && e.before) + ' → ' + creditNum(e && e.after);
+}
+function creditEntryText(e) {
+  return creditTimeText(e) + ' | ' + creditAccountText(e) + ' | ' + creditDeltaText(e && e.delta) +
+    ' | ' + creditBalanceText(e) + ' | ' + creditDescText(e);
+}
+function creditHistoryNote(entries) {
+  entries = entries || [];
+  if (!entries.length) return '暂无积分变动记录';
+  let net = 0;
+  for (const e of entries) net += Number(e && e.delta || 0);
+  return entries.length + ' 条 · 净 ' + (net > 0 ? '+' : net < 0 ? '−' : '') + creditNum(Math.abs(net));
+}
+function renderCreditHistory(d) {
+  const body = $('creditBody'), note = $('creditNote');
+  if (!body) return;
+  if (!d) {
+    if (note) note.textContent = '积分历史不可用';
+    body.innerHTML = '<tr><td colspan="5" class="empty">积分历史不可用</td></tr>';
+    return;
+  }
+  const entries = d.entries || [];
+  if (note) note.textContent = creditHistoryNote(entries);
+  body.innerHTML = entries.length
+    ? entries.map(e => '<tr>' +
+      '<td>' + esc(creditTimeText(e)) + '</td>' +
+      '<td>' + esc(creditAccountText(e)) + '</td>' +
+      '<td class="num">' + esc(creditDeltaText(e && e.delta)) + '</td>' +
+      '<td class="num">' + esc(creditBalanceText(e)) + '</td>' +
+      '<td>' + esc(creditDescText(e)) + '</td>' +
+      '</tr>').join('')
+    : '<tr><td colspan="5" class="empty">暂无积分变动记录</td></tr>';
+}
+function creditLimitValue() {
+  const el = $('creditLimit');
+  const n = el ? Number(el.value) : 100;
+  return n === 300 || n === 1000 ? n : 100;
+}
+async function loadCreditHistory() {
+  let d = null;
+  try { d = await api('credit_history?limit=' + creditLimitValue()); } catch (e) { d = null; }
+  renderCreditHistory(d);
+}
+if ($('creditLimit')) $('creditLimit').onchange = loadCreditHistory;
+if ($('btnCreditReload')) $('btnCreditReload').onclick = loadCreditHistory;
+
+/* ── 官方补偿活动（issue #189）──────────────────────────────────────
+   上游「服务异常额外补偿 N 积分」限时活动：查状态 → 按需领取。无生效活动时整卡隐藏；
+   查询失败必须显形（否则用户看到「什么都没有」，真相却是「一个都没查成」）。 */
+let compCache = null;
+let compInFlight = null;   // 在途请求的 promise（非布尔标志：布尔标志配 force 刷新会静默空转）
+
+function compPending(rows) {
+  return (rows || []).filter(r => r && !r.skip && !r.error && r.status &&
+    r.status.active && !r.status.claimed && (r.status.credit_num || 0) > 0);
+}
+function compErrored(rows) {
+  return (rows || []).filter(r => r && r.error);
+}
+function compTotalPending(rows) {
+  return compPending(rows).reduce((s, r) => s + (r.status.credit_num || 0), 0);
+}
+// compDeadlineText 领取截止倒计时文案（上游 end_time 不带时区，按本地时区解析）。
+function compDeadlineText(endTime, now) {
+  const raw = String(endTime == null ? '' : endTime).trim();
+  if (!raw) return { text: '无截止信息', urgent: false };
+  const t = new Date(raw.replace(' ', 'T')).getTime();
+  if (!isFinite(t)) return { text: raw, urgent: false };
+  const ms = t - (now || Date.now());
+  if (ms <= 0) return { text: '已截止', urgent: true };
+  const d = Math.floor(ms / 86400000);
+  const h = Math.floor(ms % 86400000 / 3600000);
+  const text = d > 0 ? (d + ' 天 ' + h + ' 小时') : (Math.max(1, h) + ' 小时');
+  return { text: '剩 ' + text, urgent: ms <= 2 * 86400000 };
+}
+function renderCompensation(d) {
+  const rows = (d && d.accounts) || [];
+  const box = $('compBox');
+  if (!box) return;
+  const active = rows.filter(r => r && !r.error && r.status && r.status.active);
+  const failed = compErrored(rows);
+  if (!active.length && !failed.length) { box.hidden = true; return; }
+  box.hidden = false;
+  const now = Date.now();
+  const okRows = active.map(r => {
+    const s = r.status || {};
+    const done = !!s.claimed;
+    const dl = compDeadlineText(s.end_time, now);
+    const name = esc(r.nickname || String(r.uid).slice(0, 8));
+    return '<div class="comp-row"><span class="comp-who">' + name + '</span>' +
+      (done
+        ? '<span class="tag ok">已领取</span>'
+        : '<span class="tag warn">待领取</span>' +
+          '<span class="tag' + (dl.urgent ? ' bad' : ' mute') + '">' + esc(dl.text) + '</span>') +
+      '<span class="tag mute">' + esc(fmtTok(s.credit_num || 0)) + ' 积分</span>' +
+      '<span class="grow"></span>' +
+      (done ? '' : '<button class="xs" data-comp-uid="' + esc(r.uid) + '">领取</button>') +
+      '</div>';
+  }).join('');
+  const errRows = failed.map(r =>
+    '<div class="comp-row"><span class="comp-who">' + esc(r.nickname || String(r.uid).slice(0, 8)) + '</span>' +
+    '<span class="tag bad">查询失败</span>' +
+    '<span class="tag mute">' + esc(String(r.error).slice(0, 120)) + '</span></div>'
+  ).join('');
+  $('compList').innerHTML = okRows + errRows;
+  const n = compPending(rows).length;
+  let note = n ? (n + ' 个账号待领 · 共 ' + fmtTok(compTotalPending(rows)) + ' 积分') : '当前无待领补偿';
+  if (failed.length) note += ' · ' + failed.length + ' 个账号查询失败';
+  $('compNote').textContent = note;
+}
+// renderCachedCompensation 从缓存重渲染（不发请求），让倒计时走动。
+function renderCachedCompensation() {
+  if (compCache) renderCompensation(compCache);
+}
+async function loadCompensation() {
+  if (compInFlight) { await compInFlight; return; }
+  compInFlight = (async () => {
+    try {
+      const d = await api('compensation');
+      compCache = d;
+      renderCompensation(d);
+    } catch (e) {
+      const box = $('compBox');
+      if (box) box.hidden = false;
+      if ($('compList')) $('compList').innerHTML = '<div class="empty">查询失败：' + esc(e.message) + '</div>';
+      if ($('compNote')) $('compNote').textContent = '';
+    }
+  })();
+  try {
+    await compInFlight;
+  } finally {
+    compInFlight = null;
+  }
+}
+if ($('compList')) $('compList').addEventListener('click', async e => {
+  const b = e.target.closest('[data-comp-uid]');
+  if (!b) return;
+  b.disabled = true;
+  try {
+    const r = await api('accounts/' + encodeURIComponent(b.dataset.compUid) + '/compensation', { method: 'POST' });
+    const res = r.result || {};
+    if (res.claimed) toast('已领取 ' + fmtTok(res.credit || 0) + ' 积分', 'ok');
+    else if (res.error) toast('查询失败，未能确认是否有补偿', 'err');
+    else if (res.skip) toast(res.skip_msg || '无需领取', '');
+    else toast('领取失败：未知结果', 'err');
+    await loadCompensation();
+    loadOverview(true);
+    if (view === 'logs') loadCreditHistory();
+  } catch (err) {
+    toast('领取失败：' + err.message, 'err');
+  }
+});
+if ($('btnCompRefresh')) $('btnCompRefresh').onclick = () => loadCompensation();
+if ($('btnCompClaimAll')) $('btnCompClaimAll').onclick = async () => {
+  const b = $('btnCompClaimAll');
+  b.disabled = true;
+  try {
+    const r = await api('compensation_all', { method: 'POST' });
+    const s = r.summary || {};
+    if (s.errored) toast(s.errored + ' 个账号查询失败，未能确认是否有补偿', 'err');
+    else if (s.claimed) toast('已领取 ' + s.claimed + ' 个账号，共 ' + fmtTok(s.credit || 0) + ' 积分', 'ok');
+    else toast('当前没有待领补偿', '');
+    await loadCompensation();
+    loadOverview(true);
+    if (view === 'logs') loadCreditHistory();
+  } catch (e) {
+    toast('领取失败：' + e.message, 'err');
+  } finally {
+    b.disabled = false;
+  }
+};
+
 function refreshVisible() {
   // 标签页在后台时不刷：看不见的轮询只是白耗电、白占上游连接，回来时补一次就够了
   //（visibilitychange 里立即刷一次）。
   if (document.hidden) return;
   // accounts / checkin 的 loadOverview 内部已经刷过全局状态，别重复请求。
-  if (view === 'accounts' || view === 'checkin') loadOverview(true);
+  if (view === 'accounts' || view === 'checkin') { loadOverview(true); renderCachedCompensation(); }
+  else if (view === 'dashboard') { loadStatus(true); loadStats(); renderCachedCompensation(); }
   else {
     // 其余视图都单独刷一次全局状态：侧边栏连接指示、顶栏运行时长、别名映射不属于
     // 任何单一视图，只有 applyStatus 会更新它们。少了这句，停在仪表盘 / 模型与档位 /
     // 配置页时侧边栏会冻在首屏那一刻的状态（原本就是如此，顺手一起修）。
     loadStatus(true);
-    if (view === 'dashboard') loadStats();
-    else if (view === 'logs') loadLogs();
+    if (view === 'logs') loadLogs();
   }
   // 任务弹窗开着时也拉日志，好把一键完成进度画在弹窗里（不必切到运行日志）。
   if (view !== 'logs' && $('taskVeil') && $('taskVeil').classList.contains('on')) loadLogs();
 }
 function start() {
   loadOverview(true);
+  loadCompensation(); // 补偿状态：首次进页面查一次（之后靠缓存重渲染）
   if (refTimer) clearInterval(refTimer);
   refTimer = setInterval(refreshVisible, POLL_MS);
   checkAuthGate();

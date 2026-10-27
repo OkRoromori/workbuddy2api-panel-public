@@ -34,7 +34,7 @@
 | 项 | 内容 |
 |---|---|
 | ① 更上游的源头 | [`Sliverkiss/workbuddy2api`](https://github.com/Sliverkiss/workbuddy2api)，作者 **Sliverkiss** —— 网关内核、协议适配、错误分类、提示词体系、账号池设计的出处，**它的 README 才是基础功能的权威文档** |
-| ② 原项目（本仓库直接基于） | [`linguo2625469/workbuddy2api-panel`](https://github.com/linguo2625469/workbuddy2api-panel)，作者 **linguo2625469** —— 在 ① 之上做出 **Web 管理面板与面板侧运维层**；**本仓库就是从它 fork 的**；基座 v1.11.0-panel（`b4245a8`），已吸收到 `6b31db6`（1.13.0-panel，2026-10-08） |
+| ② 原项目（本仓库直接基于） | [`linguo2625469/workbuddy2api-panel`](https://github.com/linguo2625469/workbuddy2api-panel)，作者 **linguo2625469** —— 在 ① 之上做出 **Web 管理面板与面板侧运维层**；**本仓库就是从它 fork 的**；基座 v1.11.0-panel（`b4245a8`），已吸收到 `73a7560`（2026-10-21，上游在该提交发布停止维护声明） |
 | ③ 本仓库 | [`OkRoromori/workbuddy2api-panel-public`](https://github.com/OkRoromori/workbuddy2api-panel-public) —— ② 的增强分支，增量见下节 |
 | 许可 | 继承 MIT License，**三层版权声明都保留**（[LICENSE](LICENSE) 顶部三行 Copyright） |
 | 引用要求 | 再分发（源码或二进制）时保留 ① 与 ② 的 MIT 版权与许可声明，并注明原始出处 `https://github.com/Sliverkiss/workbuddy2api` |
@@ -120,10 +120,13 @@
 
 ### 与 ② 原项目的同步状态
 
-本分支以 ② 的 `v1.11.0-panel`（`b4245a8`，2026-09-19）为基座，**已吸收 ② 到 `v1.13.0-panel`（`6b31db6`，2026-10-08）的全部修复**：
+本分支以 ② 的 `v1.11.0-panel`（`b4245a8`，2026-09-19）为基座，**已吸收 ② 到 `73a7560`（2026-10-21）的全部修复**：
+
+> ⚠️ ② 上游已在 `73a7560` 发布**停止维护声明**（明确反对反向代理用途）。本分支是个人自用的派生，仅吸收到该提交为止；此后不再有上游同步。
 
 | ② 的提交 | 内容 | 本分支 |
 |---|---|---|
+| `73a7560`（10-21） | **约 50 个提交（上游最后一批）**：官方补偿活动（查状态 / 领取 / 截止倒计时，`scheduler/compensation` + `upstream/compensation`）/ 积分历史账本（新包 `credithist`，按余额快照差分留痕）/ 按地区独立调度策略（加权随机 / 轮询 / 顺序耗尽 + 账号顺序）/ 任务补领清扫（issue #174）/ 联网搜索端点 `POST /v1/search/messages` / 企业切换会话（`token_source=enterprise_switch`）门控 / 模型黑名单 `models.hidden` / 裸名跨域回退（本分支沿用软域回退语义）/ 6021 `queue.full` 归通道级繁忙、11158 模型权限错误分流、11-128 通道校验分流 / 同账号 refresh 单飞防 12153 / 出站 DNS 可指定、支持 `http.ProxyFromEnvironment`、`cn.chat_base` / 到期提醒快照与检查同口径 / 面板手机端适配 | **已吸收**（Go 侧全部 + 配套测试）。前端保留本分支 iOS 版：新增「官方补偿」卡片、「运行日志 → 积分历史」表、按地区调度与任务补领清扫配置项；未采用上游的手机端独立样式（本分支已有响应式）与模型页筛选 / 本地备注等纯前端增强 |
 | `6b31db6`（10-08） | **26 个提交（1.11.11 → 1.13.0）**：模型原生工具调用标记修复（DSML，修 Codex 回合空转）/ 空 tool_call name 剔除（修 11133）/ 企业版账号能力门控 + 企业额度 / prompt_cache_key 无会话时回退 / 暂停号口径修正（旅行与成长照常，仅夜猫子跳过）/ 模型锁池视图（后端聚合）/ 面板若干修复 | **已吸收**（Go 侧全部 + 配套测试）。面板前端保留本分支 iOS 版：吸收「已暂停选号」单列统计、「记录调用来源」开关、CFG_MAP↔表单一致性测试；模型锁池视图与原生标记修复为后端能力（前端视图未加，接口可用） |
 | `ea3a51c`（10-05） | **115 个提交的大同步（1.11.1 → 1.11.11+）**：号池「暂停选号」paused / 积分保底 credit_floor / 倍率表启动预热；服务端模型级阻塞口径、吐字速率扣首字、入站读取上限可配、bad_params 归请求级 400、reqlog 请求归档（新包）；上游适配 GPT 系 max_tokens 下限、国际服多路 UA 目录探测、tool_pairing/profile 增强；CI（`.github/workflows`：推送测试 + 五平台编译，打 tag 自动发 Release） | **已吸收**（Go 侧全部 + 配套测试）。面板前端保留本分支 iOS 版，只吸收逻辑修复（覆盖型配置可清空、密钥输入框独立表单防凭据配对、账号行暂停/恢复选号按钮）；② 移除的开学季任务扫描已跟随（活动期 09-13~09-24 已结束；券码查询保留） |
 | `08752df`（09-20） | `fix(panel)`: run_queue 建队合并 mp 口径待办——修「扫描显示待办但执行队列报无可执行」 | **已吸收**。把扫描与执行队列两处口径收成一个 `mergeMPPending`（同一份实现，不再各写一遍），并补回归测试 `internal/panel/taskcenter_test.go`：去掉调用即复现原症状「无可执行待办（全部账号任务已完成）」 |

@@ -51,18 +51,17 @@ func TestCreditPackagesEndTimePrecedence(t *testing.T) {
 	if got, perr := time.Parse(time.RFC3339, packs[0].EndTime); perr != nil || !got.Equal(ded) {
 		t.Errorf("packs[0](%s).EndTime=%q want instant %s (err=%v)", packs[0].Name, packs[0].EndTime, ded, perr)
 	}
-	want := []string{
-		"",
-		"2026-11-05 12:00:00",
-		"2026-12-01",
-		"",
+	// 2) 只有 CycleEndTime：同样按时刻渲染 RFC3339（UTC+8 墙钟口径）。
+	wantB := time.Date(2026, 11, 5, 12, 0, 0, 0, softRateResetLoc)
+	if got, perr := time.Parse(time.RFC3339, packs[1].EndTime); perr != nil || !got.Equal(wantB) {
+		t.Errorf("packs[1](%s).EndTime=%q want instant %s (err=%v)", packs[1].Name, packs[1].EndTime, wantB, perr)
 	}
-	for i, w := range want {
-		if i == 0 {
-			continue // 已按时刻断言
-		}
-		if packs[i].EndTime != w {
-			t.Errorf("packs[%d](%s).EndTime=%q want %q", i, packs[i].Name, packs[i].EndTime, w)
-		}
+	// 3) 只有 ExpiredTime 且形态不是 packageEndLayout（缺时分秒）→ 解析失败，保留原串兜底。
+	if packs[2].EndTime != "2026-12-01" {
+		t.Errorf("packs[2](%s).EndTime=%q want %q", packs[2].Name, packs[2].EndTime, "2026-12-01")
+	}
+	// 4) 全空 = 长期包 → 留空（前端显示 —），不伪造日期。
+	if packs[3].EndTime != "" {
+		t.Errorf("packs[3](%s).EndTime=%q want empty", packs[3].Name, packs[3].EndTime)
 	}
 }
